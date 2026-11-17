@@ -55,14 +55,6 @@ struct wq_info_t
     /// Device version (V1/V2/V3).
     enum accfg_device_version dev_version;
 
-    /// Path (vector indices) within Topology. Changed after topo rebuild.
-    struct
-    {
-        int device;
-        int group;
-        int wq;
-    } path;
-
 #ifdef __cplusplus
     int wq() const;        ///! Internal WQ number
 #endif
@@ -82,6 +74,8 @@ uint64_t idxd_wq_max_transfer_size(const struct wq_info_t* info);
 uint32_t idxd_wq_max_batch_size(const struct wq_info_t* info);
 bool idxd_wq_block_on_fault(const struct wq_info_t* info);
 bool idxd_wq_has_opcode(const struct wq_info_t* info, unsigned opcode);
+bool idxd_wq_is_shared(const struct wq_info_t* info);
+bool idxd_wq_is_targetable(const struct wq_info_t* info);
 #ifdef __cplusplus
 }
 #endif

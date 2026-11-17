@@ -252,7 +252,8 @@ endif
 
 if get_option('selftests')
     framework_files += files(
-        'selftest.cpp'
+        'selftest.c',
+        'selftest.cpp',
     )
 else
     default_c_flags += [
@@ -366,6 +367,8 @@ if host_machine.cpu_family() == 'x86_64'
     unittests_sources += files(
         'sandstone_utils.cpp',
         'Floats.cpp',
+        'unit-tests/sandstone_contiguous_comparable_tests.cpp',
+        'unit-tests/sandstone_report_stubs.cpp',
         'unit-tests/sandstone_data_tests.cpp',
         'unit-tests/sandstone_utils_tests.c',
         'unit-tests/sandstone_utils_tests.cpp',

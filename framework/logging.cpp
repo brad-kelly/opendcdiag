@@ -1788,8 +1788,31 @@ inline AbstractLogger::AbstractLogger(const struct test *test, std::span<const C
     for_each_main_thread(message_checker, slices.size());
     for_each_test_thread(message_checker, slices.size());
 
+    for (size_t slice = 0; slice < slices.size(); ++slice) {
+        if (slices[slice].result != TestResult::Skipped)
+            continue;
+        // An init-skipped slice never starts its workers; they aren't successes.
+        auto range = sApp->main_thread_data(slice)->thread_range;
+        for (int i = 0; i < range.thread_count; ++i) {
+            auto data = sApp->test_thread_data(range.starting_thread + i);
+            if (!data->has_failed() && data->thread_state.load(std::memory_order_relaxed) == thread_not_started)
+                ++sc;
+        }
+    }
+
     if (testResult == TestResult::Passed && pc == sc)
         testResult = TestResult::Skipped;       // all threads skipped
+}
+
+bool AbstractLogger::is_skip_only(const LogMessagesFile &msgs) const
+{
+    if (!skipInMainThread)
+        return false;
+    for (const LogMessage &msg : msgs) {
+        if (msg.type != LogTypes::SkipMessages)
+            return false;
+    }
+    return true;
 }
 
 LogLevelVerbosity AbstractLogger::loglevel() const
@@ -2149,7 +2172,7 @@ YamlLogger::print_one_thread_messages(int fd, const LogMessagesFile &msgs, LogLe
     return lowest_level;
 }
 
-void YamlLogger::print_result_line(int &init_skip_message_bytes)
+void YamlLogger::print_result_line()
 {
     LogLevelVerbosity loglevel = this->loglevel();
     if (loglevel == LOG_LEVEL_QUIET && file_log_fd != real_stdout_fd && sApp->shmem->cfg.verbosity < 1) {
@@ -2181,7 +2204,6 @@ void YamlLogger::print_result_line(int &init_skip_message_bytes)
                 if (loglevel <= sApp->shmem->cfg.verbosity && file_log_fd != real_stdout_fd)
                     format_and_print_skip_reason(real_stdout_fd, message);
                 format_and_print_skip_reason(file_log_fd, message);
-                init_skip_message_bytes = init_skip_message.size() + 2;
             } else {
                 logging_printf(loglevel, "  skip-category: %s\n", "Unknown");
                 logging_printf(loglevel, "  skip-reason: %s\n",
@@ -2257,7 +2279,7 @@ void YamlLogger::print_fixed()
     using ::format_duration;
     Duration test_duration = MonotonicTimePoint::clock::now() - sApp->current_test_starttime;
 
-    print_result_line(init_skip_message_bytes);
+    print_result_line();
     if (should_print_fail_info())
         logging_printf(LOG_LEVEL_QUIET, "%s", fail_info_details().c_str());
     logging_printf(LOG_LEVEL_VERBOSE(1), "  time-at-end:   %s\n", get_current_time().c_str());
@@ -2283,16 +2305,16 @@ void YamlLogger::print_thread_messages()
     auto doprint = [this](PerThreadData::Common *data, int s_tid, int device=-1) {
         LogMessagesFile r = maybe_mmap_log(data);
         bool want_print = data->has_failed() || sApp->shmem->cfg.verbosity >= 3;
-        ssize_t min_size = 0;
+        bool skip_only = false;
 
-        /* for main threads (negative ids) adjust the message size to account
-         * for skip message. this is to avoid empty messages printed to the log.
+        /* for main threads (negative ids), skip messages were already printed
+         * in the result line. this is to avoid empty messages printed to the log.
          */
         if (s_tid < 0 && !want_print) {
-            min_size = init_skip_message_bytes;
+            skip_only = is_skip_only(r);
             want_print = want_slice_resource_usage(~s_tid);
         }
-        if (r.size_bytes() <= min_size && !want_print) {
+        if ((r.empty() || skip_only) && !want_print) {
             munmap_and_truncate_log(data, r);
             return;             /* nothing to be printed, on any level */
         }

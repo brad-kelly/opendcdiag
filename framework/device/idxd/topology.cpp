@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <compare>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -32,44 +33,6 @@
 #include <vector>
 
 struct wq_info_t* device_info = nullptr;
-
-/// Maps each operation feature bit set in features to its IDXD opcode. Op must match its dev_type.
-std::vector<unsigned> features_to_opcodes(device_features_t features, accfg_device_type dev_type)
-{
-    std::vector<unsigned> res;
-    for (auto [feature, opcode, entry_type] : feature_to_opcode_map) {
-        if ((features & feature) == 0)
-            continue;
-        if (entry_type != dev_type)
-            continue;
-        res.push_back(opcode);
-    }
-    return res;
-}
-
-/// Feature bits a device of this type and version satisfies, excluding op bits.
-device_features_t device_type_features(accfg_device_type dev_type, unsigned version)
-{
-    device_features_t features = 0;
-    if (dev_type == ACCFG_DEVICE_DSA) {
-        features |= device_feature_dsa;
-        if (version >= ACCFG_DEVICE_VERSION_1)
-            features |= device_feature_dsa_v1;
-        if (version >= ACCFG_DEVICE_VERSION_2)
-            features |= device_feature_dsa_v2;
-        if (version > ACCFG_DEVICE_VERSION_2)
-            features |= device_feature_dsa_v3;
-    } else if (dev_type == ACCFG_DEVICE_IAX) {
-        features |= device_feature_iax;
-        if (version >= ACCFG_DEVICE_VERSION_1)
-            features |= device_feature_iax_v1;
-        if (version >= ACCFG_DEVICE_VERSION_2)
-            features |= device_feature_iax_v2;
-        if (version > ACCFG_DEVICE_VERSION_2)
-            features |= device_feature_iax_v3;
-    }
-    return features;
-}
 
 int num_packages()
 {
@@ -129,26 +92,33 @@ void update_topology(std::span<const wq_info_t> new_wq_info)
 } // end anonymous namespace
 
 /// Supported modes:
-/// --deviceset=dsa0,iax2       -> target all WQ of specified devices
+/// --deviceset=dsa             -> target all WQs of specified device type
+/// --deviceset=dsa0,iax2       -> target all WQs of specified devices
 /// --deviceset=wq0.1,wq1.2     -> target specific WQs, cpus are auto attached
-/// --deviceset=wq0.1c0,wq1.2c5 -> target specific WQs, with manually specified cpus
+/// --deviceset=wq0.1c0,wq1.2c5 -> target specific WQs, with manually specified cpus (1:1)
+/// --deviceset=wq0.0c0,wq0.0c1 -> target specific WQ, with multiple manually specified cpus (1:X)
 void apply_deviceset_param(const char *param)
 {
     if (SandstoneConfig::RestrictedCommandLine)
         return;
 
-    struct WQMatch {
+    struct WqCpuPair {
         int device_id;
         int wq_id;
-        bool operator()(const wq_info_t &wq)
-        { return wq.device_id == device_id && wq.wq_id == wq_id; }
+        int cpu_number = -1;    // -1 matches any cpu
+        auto operator<=>(const WqCpuPair&) const = default;
+        bool operator()(const wq_info_t &wq) const
+        {
+            return wq.device_id == device_id && wq.wq_id == wq_id &&
+                    (cpu_number < 0 || wq.cpu_number == cpu_number);
+        }
     };
 
     std::span<wq_info_t> old_wq_info(device_info, sApp->device_count);
     std::vector<wq_info_t> new_wq_info;
     int total_matches = 0;
 
-    std::set<std::pair<uint32_t, uint32_t>> result; // set of unique wqs to disallow duplicate entries
+    std::set<WqCpuPair> result; // set of unique wq:cpu pairings to disallow duplicate entries
     new_wq_info.reserve(old_wq_info.size());
 
     bool add = true;
@@ -160,19 +130,20 @@ void apply_deviceset_param(const char *param)
     }
 
     const auto apply_to_set = [&](const wq_info_t &wq) {
-        if (result.contains({wq.device_id, wq.wq_id})) { // we've got a duplicate
+        if (result.contains({wq.device_id, wq.wq_id, wq.cpu_number})) { // we've got a duplicate
             return;
         }
 
         if (add) {
             new_wq_info.push_back(wq);
         } else {
-            auto it = std::find_if(new_wq_info.begin(), new_wq_info.end(), WQMatch{wq.device_id, wq.wq_id} );
+            auto it = std::find_if(new_wq_info.begin(), new_wq_info.end(),
+                                   WqCpuPair{wq.device_id, wq.wq_id, wq.cpu_number});
             if (it == new_wq_info.end())
                 return;
             new_wq_info.erase(it);
         }
-        result.insert({wq.device_id, wq.wq_id});
+        result.insert({wq.device_id, wq.wq_id, wq.cpu_number});
         ++total_matches;
     };
 
@@ -193,16 +164,17 @@ void apply_deviceset_param(const char *param)
             ++arg;
             int wq_id = parse_int(arg, orig_arg);
 
-            auto it = std::find_if(old_wq_info.begin(), old_wq_info.end(), WQMatch{device_id, wq_id} );
+            auto it = std::find_if(old_wq_info.begin(), old_wq_info.end(), WqCpuPair{device_id, wq_id} );
             if (it == old_wq_info.end()) {
                 fprintf(stderr, "%s: error: Invalid device set parameter: %s (no such wq)\n",
                         program_invocation_name, orig_arg);
                 exit(EX_USAGE);
             }
 
+            int cpu_number = -1;
             if (*arg == 'c') {
                 ++arg;
-                int cpu_number = parse_int(arg, orig_arg);
+                cpu_number = parse_int(arg, orig_arg);
 
                 // check if cpu is enabled in the system
                 if (enabled_cpus.size_bytes() == 0) {
@@ -213,8 +185,6 @@ void apply_deviceset_param(const char *param)
                             program_invocation_name, orig_arg);
                     exit(EX_USAGE);
                 }
-
-                it->cpu_number = cpu_number;
             }
 
             if (*arg != '\0') {
@@ -223,20 +193,37 @@ void apply_deviceset_param(const char *param)
                 exit(EX_USAGE);
             }
 
-            apply_to_set(*it);
+            if (cpu_number >= 0) {
+                // create a new one, as we don't want to modify old_cpu_info in-place
+                wq_info_t wq = *it;
+                wq.cpu_number = cpu_number;
+                apply_to_set(wq);
+            } else if (add) {
+                apply_to_set(*it);
+            } else {
+                // !wqX.Y case - remove all pairings
+                for (const auto &wq : old_wq_info) {
+                    if (WqCpuPair{device_id, wq_id}(wq))
+                        apply_to_set(wq);
+                }
+            }
         } else if (strncmp(arg, "dsa", 3) == 0 || strncmp(arg, "iax", 3) == 0) {
             accfg_device_type dev_type = strncmp(arg, "dsa", 3) == 0 ? ACCFG_DEVICE_DSA : ACCFG_DEVICE_IAX;
             arg += 3;
-            int device_id = parse_int(arg, orig_arg);
-            if (*arg != '\0') {
-                fprintf(stderr, "%s: error: Invalid device set parameter: %s (could not parse)\n",
-                        program_invocation_name, orig_arg);
-                exit(EX_USAGE);
+
+            std::optional<int> device_id;
+            if (*arg != '\0') { // there is more to parse, most probably a number
+                device_id = parse_int(arg, orig_arg);
+                if (*arg != '\0' || *device_id < 0) {
+                    fprintf(stderr, "%s: error: Invalid device set parameter: %s (could not parse)\n",
+                            program_invocation_name, orig_arg);
+                    exit(EX_USAGE);
+                }
             }
 
             int matches_before = total_matches;
             for (auto const &wq : old_wq_info) {
-                if (wq.dev_type == dev_type && wq.device_id == device_id) { // check for dev_type is most probably redundant
+                if (wq.dev_type == dev_type && (!device_id || wq.device_id == *device_id)) {
                     apply_to_set(wq);
                 }
             }
@@ -342,15 +329,12 @@ int AccfgCtx::init()
 
 bool has_opcode(const wq_info_t& info, unsigned opcode)
 {
-    return has_opcode(Topology::topology().devices[info.path.device].op_cap, opcode);
+    return has_opcode(Topology::topology().work_queue(info).this_device->op_cap, opcode);
 }
 
 static const Topology::WorkQueue& topology_wq(const wq_info_t* info)
 {
-    const auto& group = Topology::topology().devices[info->path.device].groups[info->path.group];
-    auto it = std::ranges::find_if(group.wqs, [info](const auto& wq) { return wq.wq == info; });
-    assert(it != group.wqs.end());
-    return *it;
+    return Topology::topology().work_queue(*info);
 }
 
 extern "C" uint64_t idxd_wq_max_transfer_size(const wq_info_t* info)
@@ -360,7 +344,7 @@ extern "C" uint64_t idxd_wq_max_transfer_size(const wq_info_t* info)
 
 extern "C" uint32_t idxd_wq_max_batch_size(const wq_info_t* info)
 {
-    return Topology::topology().devices[info->path.device].max_batch_size;
+    return topology_wq(info).this_device->max_batch_size;
 }
 
 extern "C" bool idxd_wq_block_on_fault(const wq_info_t* info)
@@ -373,30 +357,14 @@ extern "C" bool idxd_wq_has_opcode(const wq_info_t* info, unsigned opcode)
     return topology_wq(info).targetable && has_opcode(*info, opcode);
 }
 
-bool has_feature(const wq_info_t& info, device_features_t features)
+extern "C" bool idxd_wq_is_shared(const wq_info_t* info)
 {
-    if (features & ~idxd_all_features_mask) {
-        // undefined bit
-        return false;
-    }
+    return topology_wq(info).mode == ACCFG_WQ_SHARED;
+}
 
-    auto this_dev_type_features = device_type_features(info.dev_type, info.dev_version);
-    auto requested_dev_type_features = features & idxd_dev_type_features_mask;
-    if ((requested_dev_type_features & this_dev_type_features) != requested_dev_type_features) {
-        // wrong device's features requested (i.e. info.dev_type=iax and device_feature_dsa_v2)
-        return false;
-    }
-
-    auto other_op_features = info.dev_type == ACCFG_DEVICE_DSA
-            ? idxd_iax_operation_features_mask : idxd_dsa_operation_features_mask;
-    if (features & other_op_features) {
-        // wrong device's features requested (i.e. info.dev_type=iax and device_feature_dsa_op_drain)
-        return false;
-    }
-
-    const accfg_op_cap& op_cap = Topology::topology().devices[info.path.device].op_cap;
-    return std::ranges::all_of(features_to_opcodes(features, info.dev_type),
-                               [&op_cap](unsigned opcode) { return has_opcode(op_cap, opcode); });
+extern "C" bool idxd_wq_is_targetable(const wq_info_t* info)
+{
+    return topology_wq(info).targetable;
 }
 
 // We require only waitpkg and enqcmd system-wide.
@@ -448,6 +416,20 @@ static device_features_t detect_features(accfg_device* device)
                 features |= device_feature_op_create_delta;
             if (has_opcode(op_cap, IDXD_OPCODE_APPLY_DELTA_REC))
                 features |= device_feature_op_apply_delta;
+            if (has_opcode(op_cap, IDXD_OPCODE_TYPE_CONV))
+                features |= device_feature_op_type_conv;
+            if (has_opcode(op_cap, IDXD_OPCODE_REDUCE))
+                features |= device_feature_op_reduce;
+            if (has_opcode(op_cap, IDXD_OPCODE_REDUCE_DUALCAST))
+                features |= device_feature_op_reduce_dualcast;
+            if (has_opcode(op_cap, IDXD_OPCODE_GATHER_REDUCE))
+                features |= device_feature_op_gather_reduce;
+            if (has_opcode(op_cap, IDXD_OPCODE_GATHER_COPY))
+                features |= device_feature_op_gather_copy;
+            if (has_opcode(op_cap, IDXD_OPCODE_SCATTER_COPY))
+                features |= device_feature_op_scatter_copy;
+            if (has_opcode(op_cap, IDXD_OPCODE_SCATTER_FILL))
+                features |= device_feature_op_scatter_fill;
             if (has_opcode(op_cap, IDXD_OPCODE_XLAT_FETCH))
                 features |= device_feature_dsa_op_xlat_fetch;
         } else if (dev_type == ACCFG_DEVICE_IAX) {
@@ -699,7 +681,6 @@ void setup_devices<WorkQueueSet>(const WorkQueueSet& enabled_devices)
         info->wq_id = enabled.wq_id;
         info->dev_type = enabled.device_type;
         info->dev_version = static_cast<accfg_device_version>(accfg_device_get_version(device_handle));
-        info->path = { -1, -1 };
 
         info++;
     }
@@ -758,7 +739,8 @@ void analyze_test_failures_for_topology(const struct test *test, const PerThread
                 auto pattern = pattern_for_wq(wq);
                 if (pattern == 0) {
                     all_wqs_failed_once = false;
-                    all_devices_failed_once = false;
+                    all_wqs_failed_equally = false;
+                    all_devices_failed_equally = false;
                     continue;
                 }
 
@@ -772,8 +754,11 @@ void analyze_test_failures_for_topology(const struct test *test, const PerThread
             }
         }
 
-        if (failed_wqs == 0)
+        if (failed_wqs == 0) {
+            all_devices_failed_once = false;
+            all_devices_failed_equally = false;
             continue;
+        }
 
         ++failed_devices;
         if (last_device_pattern && first_nonzero_pattern != last_device_pattern)
@@ -802,34 +787,6 @@ void analyze_test_failures_for_topology(const struct test *test, const PerThread
     } else {
         logging_printf(LOG_LEVEL_VERBOSE(1), "# - Some IDXD devices failed but some others succeeded\n");
     }
-}
-
-std::vector<const Topology::WorkQueue*> Topology::targetable_wqs(
-        std::optional<accfg_device_type> device_type,
-        std::optional<accfg_wq_mode> mode,
-        std::optional<unsigned int> op) const
-{
-    std::vector<const WorkQueue*> result;
-    for (const Device &device : devices) {
-        if (device_type && device.dev_type != *device_type)
-            continue;
-        if (op && !has_opcode(device.op_cap, *op))
-            continue;
-        for (const Group &group : device.groups) {
-            for (const WorkQueue &wq : group.wqs) {
-                if (wq.targetable && (!mode || wq.mode == *mode))
-                    result.push_back(&wq);
-            }
-        }
-    }
-
-    return result;
-}
-
-void slice_plan_init_for_device(SlicePlans::SlicesArray& plans, int max_cores_per_slice)
-{
-    SlicePlans::Slices plan = { SlicePlans::Slice{ DeviceRange{ 0, device_count() }, {} } };
-    plans.fill(plan);
 }
 
 int slice_plan_init_for_threads(SlicePlans::SlicesArray& plans, ThreadRatio ratio_type)

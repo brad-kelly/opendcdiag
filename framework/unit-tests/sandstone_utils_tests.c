@@ -5,6 +5,83 @@
 
 #include <sandstone.h>
 #include "fp_vectors/Floats.h"
+#include "sandstone_data.h"
+
+#include <float.h>
+#include <stddef.h>
+
+#if LDBL_MANT_DIG == 53
+_Static_assert(DATATYPEFORTYPE(0.L) == Float64Data, "binary64 long double");
+#elif LDBL_MANT_DIG == 64
+_Static_assert(DATATYPEFORTYPE(0.L) == Float80Data, "x87 long double");
+#elif LDBL_MANT_DIG == 113
+_Static_assert(DATATYPEFORTYPE(0.L) == Float128Data, "binary128 long double");
+#endif
+
+// Direct DATATYPEFORTYPE coverage.
+int test_datatypefortype_c(void)
+{
+    _Bool b = 0;
+    char c = 0;
+    uint8_t u8 = 0;
+    uint16_t u16 = 0;
+    uint32_t u32 = 0;
+    unsigned long ul = 0;
+    unsigned long long ull = 0;
+    __uint128_t u128 = 0;
+    int8_t i8 = 0;
+    int16_t i16 = 0;
+    int32_t i32 = 0;
+    long l = 0;
+    long long ll = 0;
+    __int128_t i128 = 0;
+    HFloat8 hf8 = new_hfloat8(0, 0, 0);
+    BFloat8 bf8 = new_bfloat8(0, 0, 0);
+    BFloat16 bf16 = new_bfloat16(0, 0, 0);
+    Float16 f16 = new_float16(0, 0, 0);
+    float f32 = 0.0f;
+    double f64 = 0.0;
+    long double f80 = 0.0L;
+
+    if (DATATYPEFORTYPE(b) != UInt8Data) return __LINE__;
+    if (DATATYPEFORTYPE(c) != UInt8Data) return __LINE__;
+    if (DATATYPEFORTYPE(u8) != UInt8Data) return __LINE__;
+    if (DATATYPEFORTYPE(u16) != UInt16Data) return __LINE__;
+    if (DATATYPEFORTYPE(u32) != UInt32Data) return __LINE__;
+    if (DATATYPEFORTYPE(ul) != (sizeof(unsigned long) == sizeof(unsigned long long) ? UInt64Data : UInt32Data)) return __LINE__;
+    if (DATATYPEFORTYPE(ull) != UInt64Data) return __LINE__;
+    if (DATATYPEFORTYPE(u128) != UInt128Data) return __LINE__;
+    if (DATATYPEFORTYPE(i8) != Int8Data) return __LINE__;
+    if (DATATYPEFORTYPE(i16) != Int16Data) return __LINE__;
+    if (DATATYPEFORTYPE(i32) != Int32Data) return __LINE__;
+    if (DATATYPEFORTYPE(l) != (sizeof(long) == sizeof(long long) ? Int64Data : Int32Data)) return __LINE__;
+    if (DATATYPEFORTYPE(ll) != Int64Data) return __LINE__;
+    if (DATATYPEFORTYPE(i128) != Int128Data) return __LINE__;
+    if (DATATYPEFORTYPE(hf8) != HFloat8Data) return __LINE__;
+    if (DATATYPEFORTYPE(bf8) != BFloat8Data) return __LINE__;
+    if (DATATYPEFORTYPE(bf16) != BFloat16Data) return __LINE__;
+    if (DATATYPEFORTYPE(f16) != Float16Data) return __LINE__;
+    if (DATATYPEFORTYPE(f32) != Float32Data) return __LINE__;
+    if (DATATYPEFORTYPE(f64) != Float64Data) return __LINE__;
+    if (DATATYPEFORTYPE(f80) != SANDSTONE_LONG_DOUBLE_TYPE) return __LINE__;
+
+    return 0;
+}
+
+void test_memcmp_long_double_c(const long double *actual, const long double *expected,
+                             size_t count, int callback)
+{
+    if (callback)
+        memcmp_or_fail_cb(actual, expected, count, NULL, NULL);
+    else
+        memcmp_or_fail(actual, expected, count, "long double C comparison");
+}
+
+int test_memcmp_equal_long_double_c(const void *actual, const void *expected, size_t size)
+{
+    // Call the C selector's long double helper without requiring aligned floating pointers.
+    return memcmp_equal_long_double(actual, expected, size);
+}
 
 int test_floats_prototypes_c(void)
 {
@@ -114,7 +191,9 @@ int test_floats_prototypes_c(void)
     if (AS_FP(f) != 0.0) return __LINE__;
     if (AS_FP(float64) != 0.0) return __LINE__;
     if (AS_FP(d) != 0.0) return __LINE__;
+#ifdef SANDSTONE_NATIVE_FLOAT80
     if (AS_FP(float80) != 0.0) return __LINE__;
+#endif
 
     new_random_hfloat8();
     new_random_bfloat8();

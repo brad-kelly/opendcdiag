@@ -136,10 +136,9 @@ inline auto operator==(LogLevelVerbosity a, int b) noexcept
 
 /*
 * Returns a vector with device-specific tests that should be
-* added as last tests to the test list. An example of such
-* test (device-agnostic, however) is mce_check.
+* added as last tests to the test list.
 */
-std::vector<struct test*> special_tests_for_device();
+std::vector<struct test*> postexec_tests_for_device();
 
 /*
 * Returns formatted string, with comma separated features
@@ -253,12 +252,18 @@ struct TestConfig
     };
     static constexpr auto DefaultOutputFormat = SANDSTONE_DEFAULT_LOGGING;
 
+    enum class RandomControl : uint32_t {
+        uniform_thread_seed     = 1u << 0,  // all threads seeded uniformly
+        fixed_seed              = 1u << 1,  // do not advance seed between tests
+    };
+
     // test execution
     bool selftest = false;
     bool ud_on_failure = false;
     bool use_strict_runtime = false;
     bool sync_thread_start = false;
     RescheduleMode reschedule_mode = RescheduleMode::unset;
+    uint32_t random_control_flags = 0;
 
     // logging parameters
     LogLevelVerbosity verbosity = LogLevelVerbosity::Error;
@@ -323,6 +328,14 @@ struct SandstoneApplication : SandstoneApplicationConfig, public test_the_test_d
     using OutputFormat = TestConfig::OutputFormat;
 
     struct SharedMemory;
+
+    enum class TestPhase { inactive, initializing, running, cleanup };
+
+    // Process-local: only the coordinator writes, before launching or after joining threads.
+    // Phases cover per-attempt callbacks, not preparation, device finishing, or
+    // failure-callback destruction. The current test remains set through all of those.
+    const struct test *current_test = nullptr;
+    TestPhase test_phase = TestPhase::inactive;
 
     HardwareInfo hwinfo;
     SlicePlans slice_plans;
@@ -650,7 +663,8 @@ int log_skip_or_print(SkipCategory cat, const char *fmt, ...) ATTRIBUTE_PRINTF(2
 
 /* random.cpp */
 void random_init_global(const char *argument);
-void random_advance_seed();
+void random_advance_seed() noexcept;
+void random_restore_seed() noexcept;
 std::string random_format_seed();
 void random_init_thread(int thread_num);
 uint32_t random_seed_low32();

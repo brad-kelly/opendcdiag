@@ -7,6 +7,8 @@ load helpers
 MAX_PROC=`nproc`
 
 setup_file() {
+    [[ "$SANDSTONE_DEVICE_TYPE" = "CPU" ]] || skip "Tests specific to CPU"
+
     if [[ -e /sys/devices/system/cpu/cpu0 ]] && [[ -e /sys/devices/system/cpu/cpu$n ]]; then
         false "Don't run this bats under taskset"
     fi
@@ -266,6 +268,34 @@ selftest_log_skip_init_socket_common() {
 
 @test "selftest_log_skip_init_socket1" {
     selftest_log_skip_init_socket_common 'main 1' selftest_log_skip_init_socket1
+}
+
+selftest_log_skip_init_socket_result() {
+    local socket=$1 worker_result=$2 expected_result=$3
+    local testname=selftest_log_skip_init_socket$socket
+    declare -A yamldump
+    test_run_fakesockets sandstone_selftest --max-cores-per-slice=2 -e "$testname" \
+        -O "$testname.run_result=$worker_result" --fatal-skips
+    [[ "$status" -eq 1 ]]
+    test_yaml_numeric "/tests@len" 'value == 1'
+    test_yaml_regexp "/tests/0/result" "$expected_result"
+    test_yaml_regexp "/exit" fail
+}
+
+@test "init-skipped socket0 and all remaining workers skipped" {
+    selftest_log_skip_init_socket_result 0 -1 skip
+}
+
+@test "init-skipped socket1 and all remaining workers skipped" {
+    selftest_log_skip_init_socket_result 1 -1 skip
+}
+
+@test "init-skipped socket0 preserves worker failure" {
+    selftest_log_skip_init_socket_result 0 1 fail
+}
+
+@test "init-skipped socket1 preserves worker failure" {
+    selftest_log_skip_init_socket_result 1 1 fail
 }
 
 @test "selftest_failinit_socket1 --max-cores-per-slice" {
@@ -684,6 +714,20 @@ function selftest_cpuset_accumulate() {
     test_yaml_regexp "/tests/0/threads/3/messages/1/text" "I> ${cpuset[3]}\$"
 }
 
+# Threads must move with every rescheduling mode except "none"
+@test "selftest_reschedule_loop with all modes" {
+    if (( MAX_PROC < 2 )); then
+        skip "Need at least 2 logical processors to run this test"
+    fi
+
+    local mode
+    for mode in none queue random barrier; do
+        declare -A yamldump
+        sandstone_selftest -e selftest_reschedule_loop --reschedule=$mode
+        test_yaml_regexp "/tests/0/result" pass
+    done
+}
+
 @test "selftest_fail_after_reschedule" {
     $is_debug || skip "Test only works with Debug builds to mock the topology"
 
@@ -709,6 +753,59 @@ function selftest_cpuset_accumulate() {
     test_yaml_numeric "/tests/0/threads/1/previous-cpu/logical" "value == ${cpuset[1]}"
     test_yaml_numeric "/tests/0/threads/2/previous-cpu/logical" "value == ${cpuset[2]}"
     test_yaml_numeric "/tests/0/threads/3/previous-cpu/logical" "value == ${cpuset[3]}"
+}
+
+# A thread that fails before calling reschedule() must not hang its barrier partners
+@test "barrier reschedule with early failing thread" {
+    if (( MAX_PROC < 2 )); then
+        skip "Need at least 2 logical processors to run this test"
+    fi
+
+    declare -A yamldump
+    sandstone_selftest -e selftest_fail_before_reschedule --reschedule=barrier --timeout=10s
+    test_yaml_regexp "/tests/0/result" fail
+}
+
+# Barriers must be rebuilt for every retry, otherwise the retry hangs
+@test "barrier reschedule with retries" {
+    if (( MAX_PROC < 2 )); then
+        skip "Need at least 2 logical processors to run this test"
+    fi
+
+    declare -A yamldump
+    sandstone_selftest -e selftest_fail_before_reschedule --reschedule=barrier --timeout=10s \
+        --retest-on-failure=3
+    test_yaml_regexp "/tests/0/result" fail
+    test_yaml_regexp "/tests/0/state/retry" False
+    for i in 1 2 3; do
+        test_yaml_regexp "/tests/$i/result" fail
+        test_yaml_regexp "/tests/$i/state/retry" True
+    done
+}
+
+# A thread that finishes early must not break its partner's later reschedules
+@test "selftest_barrier_retirement" {
+    $is_debug || skip "Test only works with Debug builds to mock the topology"
+
+    export SANDSTONE_MOCK_TOPOLOGY='p0c0 p0c1'
+    local -a cpuset=(`$SANDSTONE --dump-cpu-info | awk '/^[0-9]/ { print $1 }'`)
+
+    declare -A yamldump
+    sandstone_selftest -e selftest_barrier_retirement --reschedule=barrier \
+        --cpuset=${cpuset[0]},${cpuset[1]} --timeout=10s
+    test_yaml_regexp "/tests/0/result" pass
+
+    # thread 0 retires from its barrier pair after a single reschedule
+    test_yaml_regexp "/tests/0/threads/0/messages/0/text" "W> thread 0 starting on cpu ${cpuset[0]}"
+    test_yaml_regexp "/tests/0/threads/0/messages/1/text" "W> thread 0 finished early, now on cpu ${cpuset[1]}"
+
+    # thread 1 keeps rescheduling alone and must alternate between both cpus;
+    # the bug made it read a stale/out-of-bounds slot instead
+    test_yaml_regexp "/tests/0/threads/1/messages/0/text" "W> thread 1 starting on cpu ${cpuset[1]}"
+    test_yaml_regexp "/tests/0/threads/1/messages/1/text" "W> thread 1 after reschedule #0 is on cpu ${cpuset[0]}"
+    test_yaml_regexp "/tests/0/threads/1/messages/2/text" "W> thread 1 after reschedule #1 is on cpu ${cpuset[1]}"
+    test_yaml_regexp "/tests/0/threads/1/messages/3/text" "W> thread 1 after reschedule #2 is on cpu ${cpuset[0]}"
+    test_yaml_regexp "/tests/0/threads/1/messages/4/text" "W> thread 1 after reschedule #3 is on cpu ${cpuset[1]}"
 }
 
 @test "selftest_fail_after_reschedule_lowest_cpu" {

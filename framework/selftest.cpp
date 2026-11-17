@@ -55,6 +55,12 @@ using uint128_t = __uint128_t;
     F(uint32_t, 0x11111111)         \
     F(uint64_t, UINT64_C(0x0102030405060708)) \
     F(uint128_t, (uint128_t(UINT64_C(0x0102030405060708)) << 64) + UINT64_C(0x090a0b0c0d0e0f00)) \
+    F(int8_t, -0x55)                \
+    F(int16_t, -0x1111)             \
+    F(int32_t, -0x11111111)         \
+    F(HFloat8, -1.5f)               \
+    F(BFloat8, -1.5f)               \
+    F(BFloat16, -1.5f)              \
     F(Float16, -1.5f)               \
     F(float, 0.5f)                  \
     F(double, 65535.0)              \
@@ -89,6 +95,61 @@ static int selftest_pass_run(struct test * test, int)
     printf("# This was printed from the test. YOU SHOULD NOT SEE THIS!\n");
     return EXIT_SUCCESS;
 }
+
+static void selftest_lifecycle_check(const struct test *test, SandstoneApplication::TestPhase phase)
+{
+    if (current_test() != test || sApp->current_test != test || sApp->test_phase != phase)
+        report_fail_msg("Unexpected current test or lifecycle phase (expected %d, got %d)",
+                        int(phase), int(sApp->test_phase));
+}
+
+static int selftest_lifecycle_outside(struct test *)
+{
+    // postcleanup must not change the result, even if the last attempt failed or skipped.
+    if (current_test() || sApp->test_phase != SandstoneApplication::TestPhase::inactive) {
+        log_platform_message(SANDSTONE_LOG_ERROR "Lifecycle still active outside an attempt");
+        abort();
+    }
+    return EXIT_SUCCESS;
+}
+
+static int selftest_lifecycle_run_result;
+
+static int selftest_lifecycle_init(struct test *test)
+{
+    selftest_lifecycle_check(test, SandstoneApplication::TestPhase::initializing);
+    log_info("Lifecycle init");
+    if (!(test->flags & test_init_in_parent)) {
+        install_failure_callback(+[](void *) {}, test, +[](void *ptr) {
+            selftest_lifecycle_check(static_cast<struct test *>(ptr), SandstoneApplication::TestPhase::inactive);
+            log_info("Lifecycle callback destroyed");
+        });
+    }
+    selftest_lifecycle_run_result = get_testspecific_knob_value_int(test, "run_result", EXIT_SUCCESS);
+    int ret = get_testspecific_knob_value_int(test, "init_result",
+                    test->flags & test_init_in_parent ? EXIT_SKIP : EXIT_SUCCESS);
+    if (ret < 0)
+        log_skip(SelftestSkipCategory, "Lifecycle init skip");
+    else if (ret > 0)
+        log_error("Lifecycle init failure");
+    return ret;
+}
+
+static int selftest_lifecycle_run(struct test *test, int)
+{
+    selftest_lifecycle_check(test, SandstoneApplication::TestPhase::running);
+    log_info("Lifecycle worker");
+    return test->test_init ? selftest_lifecycle_run_result : EXIT_SUCCESS;
+}
+
+static int selftest_lifecycle_cleanup(struct test *test)
+{
+    selftest_lifecycle_check(test, SandstoneApplication::TestPhase::cleanup);
+    log_info("Lifecycle cleanup");
+    return EXIT_SUCCESS;
+}
+
+extern "C" int selftest_memcmp_c_run(struct test *, int);
 
 template <useconds_t Usecs>
 static int selftest_timedpass_run(struct test *test, int)
@@ -313,6 +374,31 @@ static int selftest_logs_reschedule_run(struct test *test, int thread)
     return EXIT_SUCCESS;
 }
 
+// Calls reschedule() repeatedly: threads must stay on their CPU when
+// rescheduling is disabled and must change CPU at least once when it is enabled.
+static int selftest_reschedule_loop_run(struct test *test, int thread)
+{
+    constexpr int iterations = 32;
+    bool rescheduling = device_scheduler != nullptr;
+    int moves = 0;
+
+    for (int i = 0; i < iterations; ++i) {
+        int cpu_before = sched_getcpu();
+        reschedule();
+        moves += sched_getcpu() != cpu_before;
+    }
+
+    if (!rescheduling && moves != 0) {
+        report_fail_msg("Thread moved %d times although rescheduling is disabled", moves);
+        return EXIT_FAILURE;
+    }
+    if (rescheduling && moves == 0) {
+        report_fail_msg("Thread did not move in %d calls to reschedule()", iterations);
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 static int selftest_logs_reschedule_cleanup(struct test *test)
 {
     sem_t *reschedule_sem = (sem_t *) test->data;
@@ -322,6 +408,38 @@ static int selftest_logs_reschedule_cleanup(struct test *test)
     free (reschedule_sem);
     return EXIT_SUCCESS;
 }
+
+// Thread 0 calls reschedule() once and returns, while thread 1 keeps calling
+// reschedule() after thread 0 has finished. Needs exactly 2 threads.
+static int selftest_barrier_retirement_run(struct test *test, int thread)
+{
+    log_warning("thread %d starting on cpu %d", thread, sched_getcpu());
+
+    if (thread == 0) {
+        reschedule();
+        log_warning("thread %d finished early, now on cpu %d", thread, sched_getcpu());
+        return EXIT_SUCCESS;
+    }
+
+    // thread 1: keep rescheduling after its partner (thread 0) has retired
+    for (int i = 0; i < 10; i++) {
+        reschedule();
+        log_warning("thread %d after reschedule #%d is on cpu %d", thread, i, sched_getcpu());
+    }
+
+    return EXIT_SUCCESS;
+}
+
+static int selftest_random_preinit(struct test *test)
+{
+    // use (but not print) 4 ints
+    int r1 = random();
+    int r2 = random();
+    int r3 = random();
+    int r4 = random();
+    return (r1 + r2 + r3 + r4) ? EXIT_SUCCESS : EXIT_SUCCESS;
+}
+
 static int selftest_logs_random_init(struct test *test)
 {
     // print 4 ints
@@ -429,10 +547,13 @@ static int selftest_logerror_cleanup(struct test *test)
     return EXIT_SUCCESS;
 }
 
+static int selftest_run_result;
+
 template <int PackageId> static int selftest_log_skip_socket_init(struct test *test)
 {
     if (num_packages() == 1 && device_info[0].package_id == PackageId)
         return selftest_log_skip_init(test);
+    selftest_run_result = get_testspecific_knob_value_int(test, "run_result", EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }
 
@@ -440,7 +561,9 @@ template <int PackageId> static int selftest_log_skip_socket_run(struct test *te
 {
     if (num_packages() == 1 && device_info[0].package_id == PackageId)
         return selftest_skip_run(test, thread);
-    return EXIT_SUCCESS;
+    if (selftest_run_result == EXIT_SKIP)
+        return selftest_skip_run(test, thread);
+    return selftest_run_result;
 }
 
 static int selftest_log_skip_run_all_threads(struct test *test, int)
@@ -687,6 +810,12 @@ static int selftest_reportfail_run(struct test *test, int)
     return EXIT_SUCCESS;
 }
 
+static int selftest_memcmp_c_cleanup(struct test *)
+{
+    log_info("C worker memcmp cleanup after join");
+    return EXIT_SUCCESS;
+}
+
 static int selftest_reportfailmsg_run(struct test *test, int thread)
 {
     report_fail_msg("Failure message from thread %d", thread);
@@ -699,6 +828,22 @@ static int selftest_fail_after_reschedule_run(struct test *test, int thread)
 {
     deterministic_reschedule(test, thread);
     report_fail_msg("Failed after reschedule(), on cpu %d", sched_getcpu());
+    return EXIT_SUCCESS;
+}
+
+// The last thread fails before ever calling reschedule(), while the others
+// wait a bit and then reschedule. With barrier rescheduling, the failed thread
+// must not leave its partners waiting for it forever.
+static int selftest_fail_before_reschedule_run(struct test *test, int thread)
+{
+    if (thread == thread_count() - 1) {
+        report_fail_msg("Failed before reschedule()");
+        return EXIT_FAILURE;
+    }
+
+    usleep(50000);      // let the failing thread finish first
+    for (int i = 0; i < 8; ++i)
+        reschedule();
     return EXIT_SUCCESS;
 }
 
@@ -788,6 +933,31 @@ template <typename T> static int selftest_datacomparefail_run(struct test *, int
     return EXIT_SUCCESS;
 }
 
+template <bool Pattern> static int selftest_long_double_mismatch_run(struct test *, int)
+{
+    using namespace SandstoneDataDetails;
+    constexpr DataType TYPE = TypeToDataType<long double>::Type;
+    constexpr size_t MEANINGFUL = type_real_size(TYPE);
+    long double actual[3];
+    long double expected[3];
+    long double pattern = 1.L;
+    memset(reinterpret_cast<uint8_t *>(&pattern) + MEANINGFUL, 0, sizeof(pattern) - MEANINGFUL);
+    for (size_t i = 0; i < 3; ++i) {
+        memcpy(&actual[i], &pattern, sizeof(pattern));
+        memcpy(&expected[i], &pattern, sizeof(pattern));
+        memset(reinterpret_cast<uint8_t *>(&actual[i]) + MEANINGFUL, 0x55, sizeof(pattern) - MEANINGFUL);
+        memset(reinterpret_cast<uint8_t *>(&expected[i]) + MEANINGFUL, 0xaa, sizeof(pattern) - MEANINGFUL);
+    }
+    // Earlier padding differs, but the report must identify element 2 and its value.
+    reinterpret_cast<uint8_t *>(&actual[2])[1] ^= 1;
+    auto formatter = [](ptrdiff_t idx) { return stdprintf("element %td", idx); };
+    if constexpr (Pattern)
+        memcmp_pattern_or_fail(actual, pattern, 3, formatter);
+    else
+        memcmp_or_fail(actual, expected, 3, formatter);
+    return EXIT_SUCCESS;
+}
+
 int selftest_datacompare_pattern_fail_run(struct test *, int thread)
 {
     static const uint8_t count = 16;
@@ -861,6 +1031,34 @@ static int selftest_datacompare_pattern_nodifference_run(struct test *, int)
     uint8_t actual[16];
     memset(actual, pattern, sizeof(actual));
     memcmp_byte_or_fail(actual, pattern, sizeof(pattern));
+    return EXIT_SUCCESS;
+}
+
+// _report_fail_msg is [[noreturn]] and depends on sApp->shmem, so the failure
+// paths are selftests, not gtests.
+static int selftest_container_comparefail_size_mismatch_run(struct test *, int)
+{
+    std::vector<uint32_t> actual   = {1, 2, 3, 4, 5};
+    std::vector<uint32_t> expected = {1, 2, 3, 4};
+    memcmp_or_fail(actual, expected);     // noreturn: size mismatch
+    return EXIT_SUCCESS;
+}
+
+// Content mismatch reports through SandstoneMemcmpOrFail::report(), tagged
+// with the element's own DataType (uint32_t here).
+static int selftest_container_comparefail_content_mismatch_run(struct test *, int)
+{
+    std::vector<uint32_t> actual   = {1, 2, 3, 4, 5};
+    std::vector<uint32_t> expected = {1, 2, 3, 4, 99};
+    memcmp_or_fail(actual, expected);     // noreturn: content mismatch
+    return EXIT_SUCCESS;
+}
+
+static int selftest_container_compare_nodifference_run(struct test *, int)
+{
+    std::vector<uint32_t> actual   = {1, 2, 3, 4, 5};
+    std::vector<uint32_t> expected = {1, 2, 3, 4, 5};
+    memcmp_or_fail(actual, expected);     // no mismatch
     return EXIT_SUCCESS;
 }
 
@@ -1177,7 +1375,7 @@ static int selftest_fork_run(struct test *test, int thread)
         log_info("Child pid: %d", pid);
         return ParentFunc(test, thread);
     } else {
-        return ChildFunc(test, thread);
+        _exit(ChildFunc(test, thread));
     }
 }
 #endif
@@ -1446,1137 +1644,995 @@ const static test_group group_test_hw_features = {
 };
 #endif
 
-static struct test selftests_array[] = {
-{
-    .id = "selftest_pass",
-    .description = "Just pass",
+DECLARE_SELFTEST(selftest_pass, "Just pass")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_selftest_passes),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_pass_beta",
-    .description = "Just pass",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_lifecycle, "Checks process-local per-attempt lifecycle phases")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_preinit = selftest_lifecycle_outside,
+    .test_init = selftest_lifecycle_init,
+    .test_run = selftest_lifecycle_run,
+    .test_cleanup = selftest_lifecycle_cleanup,
+    .test_postcleanup = selftest_lifecycle_outside,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_lifecycle_no_init, "Checks lifecycle without an init callback")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_run = selftest_lifecycle_run,
+    .test_cleanup = selftest_lifecycle_cleanup,
+    .test_postcleanup = selftest_lifecycle_outside,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_lifecycle_no_cleanup, "Checks lifecycle without a cleanup callback")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_init = selftest_lifecycle_init,
+    .test_run = selftest_lifecycle_run,
+    .test_postcleanup = selftest_lifecycle_outside,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_lifecycle_sequential, "Checks lifecycle with sequential workers")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_init = selftest_lifecycle_init,
+    .test_run = selftest_lifecycle_run,
+    .test_cleanup = selftest_lifecycle_cleanup,
+    .test_postcleanup = selftest_lifecycle_outside,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+    .flags = test_schedule_sequential,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_lifecycle_parent, "Checks lifecycle with the test in the parent")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_init = selftest_lifecycle_init,
+    .test_run = selftest_lifecycle_run,
+    .test_cleanup = selftest_lifecycle_cleanup,
+    .test_postcleanup = selftest_lifecycle_outside,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+    .flags = test_in_parent,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_lifecycle_init_parent, "Checks lifecycle with only init in the parent")
+    .test_init = selftest_lifecycle_init,
+    .test_run = selftest_lifecycle_run,
+    .test_cleanup = selftest_lifecycle_cleanup,
+    .test_postcleanup = selftest_lifecycle_outside,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+    .flags = test_init_in_parent,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_pass_beta, "Just pass")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_selftest_passes),
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_BETA,
-},
-{
-    .id = "selftest_pass_low_quality",
-    .description = "Just pass",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_pass_low_quality, "Just pass")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_selftest_passes),
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_SKIP,
-},
-{
-    .id = "selftest_timedpass",
-    .description = "Loops around usleep() for the regular test time",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timedpass, "Loops around usleep() for the regular test time")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_timedpass_run<10'000>,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #ifdef __unix__
-{
-    .id = "selftest_timedpass_fork",
-    .description = "Forks, then loops around usleep() for the regular test time",
+DECLARE_SELFTEST(selftest_timedpass_fork, "Forks, then loops around usleep() for the regular test time")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_fork_run<selftest_timedpass_run<10'000>>,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #endif
-{
-    .id = "selftest_preinit",
-    .description = "Changes some test configs in the preinit function",
+DECLARE_SELFTEST(selftest_preinit, "Changes some test configs in the preinit function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_preinit = selftest_preinit_preinit,
     .test_init = selftest_preinit_init,
     .test_run = selftest_pass_run,
     .desired_duration = INT_MAX,        // we change to -1 in the preinit
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs",
-    .description = "Adds some debug, info and warning messages",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_preinit_random, "Uses the random generator in the preinit function")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_preinit = selftest_random_preinit,
+    .test_run = selftest_pass_run,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs, "Adds some debug, info and warning messages")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_init,
     .test_run = selftest_logs_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs_with_cb",
-    .description = "Adds some debug, info and warning messages (with callback active)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_with_cb, "Adds some debug, info and warning messages (with callback active)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_init_installcallback<selftest_logs_init>,
     .test_run = selftest_logs_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #if SANDSTONE_DEVICE_CPU
-{
-    .id = "selftest_logs_l3cachesize",
-    .description = "Reports the aggregate L3 cache size of the topology (heuristic scheduling)",
+DECLARE_SELFTEST(selftest_logs_l3cachesize, "Reports the aggregate L3 cache size of the topology (heuristic scheduling)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_l3cachesize_init,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs_l3cachesize_coregroup",
-    .description = "Reports the aggregate L3 cache size of the topology (core-group scheduling)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_l3cachesize_coregroup, "Reports the aggregate L3 cache size of the topology (core-group scheduling)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_l3cachesize_init,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_schedule_isolate_coregroup,
-},
-{
-    .id = "selftest_logs_l3cachesize_socket",
-    .description = "Reports the aggregate L3 cache size of the topology (socket scheduling)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_l3cachesize_socket, "Reports the aggregate L3 cache size of the topology (socket scheduling)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_l3cachesize_init,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_schedule_isolate_socket,
-},
+END_DECLARE_TEST
 #endif // SANDSTONE_DEVICE_CPU
-{
-    .id = "selftest_logdata",
-    .description = "Logs data for later parsing",
+DECLARE_SELFTEST(selftest_logdata, "Logs data for later parsing")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_logdata_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logdata_with_cb",
-    .description = "Logs data for later parsing (with callback active)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logdata_with_cb, "Logs data for later parsing (with callback active)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_logdata_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_platform",
-    .description = "Logs platform messages (not related to the test)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_platform, "Logs platform messages (not related to the test)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_log_platform_init,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_raw_yaml",
-    .description = "Logs YAML content (raw string)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_raw_yaml, "Logs YAML content (raw string)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_lograwyaml_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_formatted_yaml",
-    .description = "Logs YAML content (using format_yaml)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_formatted_yaml, "Logs YAML content (using format_yaml)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_logformattedyaml_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs_options",
-    .description = "Logs some command-line options",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_options, "Logs some command-line options")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_options_init,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs_getcpu",
-    .description = "Logs the getcpu() result",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_getcpu, "Logs the getcpu() result")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_logs_getcpu_run,   // may skip
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs_reschedule",
-    .description = "Logs the getcpu() result before and after rescheduling",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_reschedule, "Logs the getcpu() result before and after rescheduling")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_reschedule_init,
     .test_run = selftest_logs_reschedule_run,   // may skip
     .test_cleanup = selftest_logs_reschedule_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs_random_init",
-    .description = "Logs some random numbers in the init function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_reschedule_loop, "Calls reschedule() in a loop and checks that threads move only when rescheduling is enabled")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_run = selftest_reschedule_loop_run,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_barrier_retirement, "Demonstrates barrier-pair behavior when one thread retires early (run with --reschedule=barrier --cpuset=0,1)")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_run = selftest_barrier_retirement_run,   // may skip
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_random_init, "Logs some random numbers in the init function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_random_init,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logs_random",
-    .description = "Logs some random numbers",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logs_random, "Logs some random numbers")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_logs_random_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_cxxthrowcatch",
-    .description = "Throws and catches a C++ exception",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_cxxthrowcatch, "Throws and catches a C++ exception")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_cxxthrowcatch_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_skip_minimum_cpu",
-    .description = "Skips by having unsatisfiable .minimum_cpu requirements",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_skip_minimum_cpu, "Skips by having unsatisfiable .minimum_cpu requirements")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_failinit_init,            // shouldn't get run
     .test_run = selftest_fail_run,                  // shouldn't get run
     .minimum_cpu = ~decltype(test::minimum_cpu)(0), // hopefully we won't get run where this passes!
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_skip",
-    .description = "Skips by returning EXIT_SKIP from the init function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_skip, "Skips by returning EXIT_SKIP from the init function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_skip_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_init",
-    .description = "Skips using log_skip() in the init function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_init, "Skips using log_skip() in the init function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_log_skip_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_preinit",
-    .description = "SKIP in the init function set from the test's preinit",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_preinit, "SKIP in the init function set from the test's preinit")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_preinit = selftest_log_skip_preinit,
     .test_init = selftest_failinit_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_true_skip_in_preinit",
-    .description = "SKIP in preinit",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_true_skip_in_preinit, "SKIP in preinit")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_preinit = selftest_true_skip_in_preinit,
     .test_init = selftest_failinit_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_init_mainproc",
-    .description = "Skips using log_skip() in the init function in the main process",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_init_mainproc, "Skips using log_skip() in the init function in the main process")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_init_mainproc<selftest_log_skip_init>,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_init_in_parent,
-},
-{
-    .id = "selftest_log_skip_init_from_group",
-    .description = "Skips using log_skip() in the init function, in the main process, "
-                   "applied by the group's init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_init_from_group, "Skips using log_skip() in the init function, in the main process, " "applied by the group's init")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_init_skip),
     .test_init = selftest_failinit_init,    // will be replaced!
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_init_socket0",
-    .description = "Skips using log_skip() in the init function only in socket 0",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_init_socket0, "Skips using log_skip() in the init function only in socket 0")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_log_skip_socket_init<0>,
     .test_run = selftest_log_skip_socket_run<0>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_init_socket1",
-    .description = "Skips using log_skip() in the init function only in socket 1",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_init_socket1, "Skips using log_skip() in the init function only in socket 1")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_log_skip_socket_init<1>,
     .test_run = selftest_log_skip_socket_run<1>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_run_all_threads",
-    .description = "Skips using log_skip() in the run function where all threads skip",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_run_all_threads, "Skips using log_skip() in the run function where all threads skip")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_log_skip_run_all_threads,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_run_even_threads",
-    .description = "Skips using log_skip() in the run function where only even numbered threads skip",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_run_even_threads, "Skips using log_skip() in the run function where only even numbered threads skip")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_log_skip_run_even_threads,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_log_skip_newline",
-    .description = "Skips using log_skip() in the init function where there are newlines in the message",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_log_skip_newline, "Skips using log_skip() in the init function where there are newlines in the message")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_log_skip_newline_init,
     .test_run = selftest_log_skip_newline_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_skip_cleanup",
-    .description = "SKIP in the cleanup function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_skip_cleanup, "SKIP in the cleanup function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_random_init,
     .test_run = selftest_pass_run,
     .test_cleanup = selftest_skip_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_oserror_cleanup",
-    .description = "OS error in the cleanup function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_oserror_cleanup, "OS error in the cleanup function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_random_init,
     .test_run = selftest_pass_run,
     .test_cleanup = selftest_errno_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_skipmsg_success_cleanup",
-    .description = "Log skip message with SUCCESS in the cleanup function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_skipmsg_success_cleanup, "Log skip message with SUCCESS in the cleanup function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_random_init,
     .test_run = selftest_pass_run,
     .test_cleanup = selftest_skipmsg_success_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_skipmsg_skip_cleanup",
-    .description = "Log skip message with SKIP in the cleanup function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_skipmsg_skip_cleanup, "Log skip message with SKIP in the cleanup function")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_logs_random_init,
     .test_run = selftest_pass_run,
     .test_cleanup = selftest_skipmsg_skip_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_maybe_skip_750ms",
-    .description = "Requests to run for 750 ms (could be skipped)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_maybe_skip_750ms, "Requests to run for 750 ms (could be skipped)")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_timedpass_run<(7500us).count()>,
     .desired_duration = 750,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_requires_smt",
-    .description = "Test the flag test_requires_smt",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_requires_smt, "Test the flag test_requires_smt")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_requires_smt,
-},
-{
-    .id = "selftest_timedpass_busywait",
-    .description = "Runs for the requested time, but busy-waiting", // or practically so
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timedpass_busywait, "Runs for the requested time, but busy-waiting") // or practically so
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_fail_test_the_test),
     .test_run = selftest_timedpass_run<0>,
     .desired_duration = 200,
     .fracture_loop_count = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_timedpass_tooshort",
-    .description = "Runs for the requested time, but each loop is too short",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timedpass_tooshort, "Runs for the requested time, but each loop is too short")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_fail_test_the_test),
     .test_run = selftest_timedpass_run<(250us).count()>,
     .desired_duration = 200,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_timedpass_toolong",
-    .description = "Runs for the requested time, but each loop is too long",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timedpass_toolong, "Runs for the requested time, but each loop is too long")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_fail_test_the_test),
     .test_run = selftest_timedpass_run<duration_cast<microseconds>(test_the_test_data<true>::MaximumLoopDuration).count() * 2>,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_timedpass_whileloop",
-    .description = "Runs for the requested time, but uses a while () loop instead of do {} while ()",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timedpass_whileloop, "Runs for the requested time, but uses a while () loop instead of do {} while ()")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_fail_test_the_test),
     .test_run = selftest_timedpass_whileloop_run<10'000>,
     .desired_duration = 200,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_timedpass_noloop",
-    .description = "Runs for the requested time, but doesn't loop at all",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timedpass_noloop, "Runs for the requested time, but doesn't loop at all")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_fail_test_the_test),
     .test_run = selftest_timedpass_noloop_run<10'000>,
     .desired_duration = 200,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_timedpass_no_fracture",
-    .description = "Runs for the requested time, but doesn't fracture",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timedpass_no_fracture, "Runs for the requested time, but doesn't fracture")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_fail_test_the_test),
     .test_run = selftest_timedpass_run<10'000>,
     .desired_duration = 200,
     .fracture_loop_count = -1,          /* don't fracture */
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_uses_too_much_mem",
-    .description = "Allocates and uses too much memory",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_container_comparefail_size_mismatch, "Container memcmp_or_fail with mismatched sizes (report_fail_msg path)")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_container_comparefail_size_mismatch_run,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_container_comparefail_content_mismatch, "Container memcmp_or_fail with matching sizes but differing contents")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_container_comparefail_content_mismatch_run,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_container_compare_nodifference, "Container memcmp_or_fail with matching contents")
+    .groups = DECLARE_TEST_GROUPS(&group_positive),
+    .test_run = selftest_container_compare_nodifference_run,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_uses_too_much_mem, "Allocates and uses too much memory")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_fail_test_the_test),
     .test_run = selftest_uses_too_much_mem_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_busywait_random_generation",
-    .description = "Calls the random() function in a loop",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_busywait_random_generation, "Calls the random() function in a loop")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_busywait_random_generation_run<random, 1000*1000>,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_busywait_random32_generation",
-    .description = "Calls the random32() function in a loop",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_busywait_random32_generation, "Calls the random32() function in a loop")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_busywait_random_generation_run<random32, 1000*1000>,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_busywait_random128_generation",
-    .description = "Calls the random128() function in a loop",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_busywait_random128_generation, "Calls the random128() function in a loop")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_busywait_random_generation_run<random128, 1000*1000>,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_check_sequential",
-    .description = "Checks that threads were run sequentially",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_check_sequential, "Checks that threads were run sequentially")
     .test_init = selftest_check_sequential_init,
     .test_run = selftest_check_sequential_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_schedule_sequential,
-},
-{
-    .id = "selftest_test_mainproc",
-    .description = "Checks test with flag test_in_parent if runs entirely in main process",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_mainproc, "Checks test with flag test_in_parent if runs entirely in main process")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_init = selftest_init_mainproc<selftest_pass_init>,
     .test_run = selftest_run_mainproc<selftest_pass_run>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_in_parent,
-},
-{
-    .id = "selftest_fail_run_mainproc",
-    .description = "Fails in the run function in main process",
-    .groups = DECLARE_TEST_GROUPS(&group_negative),
-    .test_run = selftest_run_mainproc<selftest_fail_run>,
-    .desired_duration = -1,
-    .quality_level = TEST_QUALITY_PROD,
-    .flags = test_in_parent,
-},
-{
-    .id = "selftest_fail_cleanup_mainproc",
-    .description = "Fails in the cleanup function in main process",
-    .groups = DECLARE_TEST_GROUPS(&group_negative),
-    .test_run = selftest_run_mainproc<selftest_pass_run>,
-    .test_cleanup = selftest_init_mainproc<selftest_fail_cleanup>,
-    .desired_duration = -1,
-    .quality_level = TEST_QUALITY_PROD,
-    .flags = test_in_parent,
-},
+END_DECLARE_TEST
 
 #if defined(__linux__) && defined(__x86_64__) && !defined(__clang__) && defined(SANDSTONE_DEVICE_CPU)
-{
-    .id = "kvm_long_64bit",
-    .description = "Runs simple 64-bit KVM workload successfully",
+DECLARE_SELFTEST(kvm_long_64bit, "Runs simple 64-bit KVM workload successfully")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_kvm),
     .test_init = kvm_generic_init,
     .test_run = kvm_generic_run,
     .test_cleanup = kvm_generic_cleanup,
     .test_kvm_config = selftest_kvm_config_long_64bit,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "kvm_real_16bit",
-    .description = "Runs simple 16-bit KVM workload successfully",
+END_DECLARE_TEST
+DECLARE_SELFTEST(kvm_real_16bit, "Runs simple 16-bit KVM workload successfully")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_kvm),
     .test_init = kvm_generic_init,
     .test_run = kvm_generic_run,
     .test_cleanup = kvm_generic_cleanup,
     .test_kvm_config = selftest_kvm_config_real_16bit,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "kvm_real_setup_check",
-    .description = "Checks the setup and check handlers are called correctly",
+END_DECLARE_TEST
+DECLARE_SELFTEST(kvm_real_setup_check, "Checks the setup and check handlers are called correctly")
     .groups = DECLARE_TEST_GROUPS(&group_positive, &group_kvm),
     .test_init = kvm_generic_init,
     .test_run = kvm_generic_run,
     .test_cleanup = kvm_generic_cleanup,
     .test_kvm_config = selftest_kvm_config_real_setup_check,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #endif // __linux__
 
     /* Randomly failing tests */
 
-{
-    .id = "selftest_randomfail_50pct",
-    .description = "Fails about 50% of the time, randomly",
+DECLARE_SELFTEST(selftest_randomfail_50pct, "Fails about 50% of the time, randomly")
     .groups = DECLARE_TEST_GROUPS(&group_random),
     .test_run = selftest_randomfail_run<std::ratio<1, 2>>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_randomfail_rare",
-    .description = "Fails less than 0.1% of the time, randomly",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_randomfail_rare, "Fails less than 0.1% of the time, randomly")
     .groups = DECLARE_TEST_GROUPS(&group_random),
     .test_run = selftest_randomfail_run<std::ratio<1, 1024>>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_timed_randomfail_25pct",
-    .description = "Randomly fails about 25% of the time, every 100 ms",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timed_randomfail_25pct, "Randomly fails about 25% of the time, every 100 ms")
     .groups = DECLARE_TEST_GROUPS(&group_random),
     .test_run = selftest_timed_randomfail_run<100'000, std::ratio<1, 4>>,
     .fracture_loop_count = 4,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_timed_randomfail_rare",
-    .description = "Randomly fails less than 0.1% of the time, every 10 ms",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_timed_randomfail_rare, "Randomly fails less than 0.1% of the time, every 10 ms")
     .groups = DECLARE_TEST_GROUPS(&group_random),
     .test_run = selftest_timed_randomfail_run<10'000, std::ratio<1, 1024>>,
     .fracture_loop_count = 4,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_datacomparefailrare_int_50pct",
-    .description = "Fakes a memcmp_or_fail that finds a difference that isn't there, 50% of the time",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacomparefailrare_int_50pct, "Fakes a memcmp_or_fail that finds a difference that isn't there, 50% of the time")
     .groups = DECLARE_TEST_GROUPS(&group_random),
             .test_run = selftest_datacomparefailrare_run<std::ratio<1, 2>>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_datacomparefailrare_int_rare",
-    .description = "Fakes a memcmp_or_fail that finds a difference that isn't there, less than 0.1% of the time",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacomparefailrare_int_rare, "Fakes a memcmp_or_fail that finds a difference that isn't there, less than 0.1% of the time")
     .groups = DECLARE_TEST_GROUPS(&group_random),
             .test_run = selftest_datacomparefailrare_run<std::ratio<1, 1024>>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_datacomparefailrare_double_50pct",
-    .description = "Fakes a memcmp_or_fail that finds a difference that isn't there, 50% of the time",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacomparefailrare_double_50pct, "Fakes a memcmp_or_fail that finds a difference that isn't there, 50% of the time")
     .groups = DECLARE_TEST_GROUPS(&group_random),
             .test_run = selftest_datacomparefailrare_run<std::ratio<1, 2>, double>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_datacomparefailrare_double_rare",
-    .description = "Fakes a memcmp_or_fail that finds a difference that isn't there, less than 0.1% of the time",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacomparefailrare_double_rare, "Fakes a memcmp_or_fail that finds a difference that isn't there, less than 0.1% of the time")
     .groups = DECLARE_TEST_GROUPS(&group_random),
             .test_run = selftest_datacomparefailrare_run<std::ratio<1, 1024>, double>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 
     /* Multi-socket tests */
-{
-    .id = "selftest_failinit_socket1",
-    .description = "Fails on init for socket 1",
+DECLARE_SELFTEST(selftest_failinit_socket1, "Fails on init for socket 1")
     .groups = nullptr, // positive on single-socket systems, negative on multi-socket
     .test_init = selftest_if_socket1_initcleanup<selftest_failinit_init>,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail_socket1",
-    .description = "Fails on any thread of socket 1",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_socket1, "Fails on any thread of socket 1")
     .groups = nullptr, // positive on single-socket systems, negative on multi-socket
     .test_run = selftest_if_socket1_run<selftest_fail_run>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_freeze_socket1",
-    .description = "Freezes on any thread of socket 1",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_freeze_socket1, "Freezes on any thread of socket 1")
     .groups = nullptr, // positive on single-socket systems, negative on multi-socket
     .test_run = selftest_if_socket1_run<selftest_noreturn_run>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_init_socket1",
-    .description = "Crashes with SIGSEGV (data) on init for socket 1",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_init_socket1, "Crashes with SIGSEGV (data) on init for socket 1")
     .groups = nullptr, // positive on single-socket systems, negative on multi-socket
     .test_init = selftest_if_socket1_initcleanup<selftest_crash_initcleanup<cause_sigsegv_null>>,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_socket1",
-    .description = "Crashes with SIGSEGV (data) dereferencing the null page for any thread of socket 1",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_socket1, "Crashes with SIGSEGV (data) dereferencing the null page for any thread of socket 1")
     .groups = nullptr, // positive on single-socket systems, negative on multi-socket
     .test_run = selftest_if_socket1_run<selftest_crash_run<cause_sigsegv_null>>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 
     /* Negative tests */
 
-{
-    .id = "selftest_failinit",
-    .description = "Fails in the init function",
+DECLARE_SELFTEST(selftest_failinit, "Fails in the init function")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_failinit_init,
     .test_run = selftest_failinit_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_failinit_and_logskip",
-    .description = "Fails by returning EXIT_FAILURE after log_skip() in init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_failinit_and_logskip, "Fails by returning EXIT_FAILURE after log_skip() in init")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_failinit_and_logskip_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror_init",
-    .description = "Fails on error logged in init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_init, "Fails on error logged in init")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_logerror_init,
     .test_run = selftest_failinit_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror_init_mainproc",
-    .description = "Fails on error logged in init from the main process",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_init_mainproc, "Fails on error logged in init from the main process")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_init_mainproc<selftest_logerror_init>,
     .test_run = selftest_failinit_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_init_in_parent,
-},
-{
-    .id = "selftest_logerror_and_logskip",
-    .description = "Fails by with log_error() and log_skip() in init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_and_logskip, "Fails by with log_error() and log_skip() in init")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_logerror_and_logskip_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror_and_logskip_exitskip",
-    .description = "Fails by with log_error(), log_skip(), return EXIT_SKIP in init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_and_logskip_exitskip, "Fails by with log_error(), log_skip(), return EXIT_SKIP in init")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_logerror_and_logskip_exitskip_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logskip_and_logerror",
-    .description = "Fails by with log_skip() and log_error() in init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logskip_and_logerror, "Fails by with log_skip() and log_error() in init")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_logskip_and_logerror_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail",
-    .description = "Fails by way of returning",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail, "Fails by way of returning")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_randomprint_init,
     .test_run = selftest_fail_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail_with_cb",
-    .description = "Fails by way of returning (callback active)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_with_cb, "Fails by way of returning (callback active)")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_fail_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail_cleanup",
-    .description = "Fails in the cleanup function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_cleanup, "Fails in the cleanup function")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_pass_run,
     .test_cleanup = selftest_fail_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail_run_and_cleanup",
-    .description = "Fails in the run and cleanup functions",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_run_and_cleanup, "Fails in the run and cleanup functions")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_fail_run,
     .test_cleanup = selftest_fail_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror_cleanup",
-    .description = "Fails in the cleanup function with log_error()",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_run_mainproc, "Fails in the run function in main process")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_run_mainproc<selftest_fail_run>,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+    .flags = test_in_parent,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_cleanup_mainproc, "Fails in the cleanup function in main process")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_run_mainproc<selftest_pass_run>,
+    .test_cleanup = selftest_init_mainproc<selftest_fail_cleanup>,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+    .flags = test_in_parent,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_cleanup, "Fails in the cleanup function with log_error()")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_pass_run,
     .test_cleanup = selftest_logerror_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail_cleanup_after_skip",
-    .description = "Fails in the cleanup function after having skipped",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_cleanup_after_skip, "Fails in the cleanup function after having skipped")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_log_skip_run_all_threads,
     .test_cleanup = selftest_fail_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror_cleanup_after_skip",
-    .description = "Fails in the cleanup function with log_error() after having skipped",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_cleanup_after_skip, "Fails in the cleanup function with log_error() after having skipped")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_log_skip_run_all_threads,
     .test_cleanup = selftest_logerror_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror",
-    .description = "Fails by calling log_error()",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror, "Fails by calling log_error()")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_logerror_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror_with_cb",
-    .description = "Fails by calling log_error() (callback active)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_with_cb, "Fails by calling log_error() (callback active)")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_logerror_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_logerror_lots",
-    .description = "Fails by calling log_error() [a lot of times]",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_logerror_lots, "Fails by calling log_error() [a lot of times]")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_logerror_lots_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_errormsg_cleanup",
-    .description = "Fails by calling log_error() in the cleanup function",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_errormsg_cleanup, "Fails by calling log_error() in the cleanup function")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_logs_random_init,
     .test_run = selftest_pass_run,
     .test_cleanup = selftest_errormsg_success_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_reportfail",
-    .description = "Fails by calling report_fail()",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_reportfail, "Fails by calling report_fail()")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_randomprint_init,
     .test_run = selftest_reportfail_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_reportfail_with_cb",
-    .description = "Fails by calling report_fail() (callback active)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_reportfail_with_cb, "Fails by calling report_fail() (callback active)")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_reportfail_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_reportfailmsg",
-    .description = "Fails by calling report_fail_msg()",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_memcmp_c, "Fails by calling memcmp_or_fail() from a C worker")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_memcmp_c_run,
+    .test_cleanup = selftest_memcmp_c_cleanup,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_reportfailmsg, "Fails by calling report_fail_msg()")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_randomprint_init,
     .test_run = selftest_reportfailmsg_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_reportfailmsg_with_cb",
-    .description = "Fails by calling report_fail_msg() (callback active)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_reportfailmsg_with_cb, "Fails by calling report_fail_msg() (callback active)")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_reportfailmsg_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail_after_reschedule",
-    .description = "Fails by calling report_fail_msg() after reschedule()",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_after_reschedule, "Fails by calling report_fail_msg() after reschedule()")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_logs_reschedule_init,
     .test_run = selftest_fail_after_reschedule_run,
     .test_cleanup = selftest_logs_reschedule_cleanup,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_fail_after_reschedule_lowest_cpu",
-    .description = "Fails by calling report_fail_msg() after reschedule(), but only on the lowest numbered CPU",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_before_reschedule, "Last thread fails before reschedule(), the others keep calling it")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_fail_before_reschedule_run,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_fail_after_reschedule_lowest_cpu, "Fails by calling report_fail_msg() after reschedule(), but only on the lowest numbered CPU")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_fail_after_reschedule_lowest_cpu_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #if defined(STATIC) && defined(__GLIBC__)
-{
-    .id = "selftest_libc_fatal",
-    .description = "Calls __libc_fatal",
+DECLARE_SELFTEST(selftest_libc_fatal, "Calls __libc_fatal")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_libc_fatal_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #endif
 
 #define DATACOMPARE_TEST(Type, Value)                                   \
-{                                                                       \
-    .id = "selftest_datacomparefail_" SANDSTONE_STRINGIFY(Type),        \
-    .description = "Attempts to compare one " SANDSTONE_STRINGIFY(Type),       \
+DECLARE_SELFTEST(SANDSTONE_CONCAT(selftest_datacomparefail_, Type), "Attempts to compare one " SANDSTONE_STRINGIFY(Type)) \
     .groups = DECLARE_TEST_GROUPS(&group_negative),                     \
     .test_run = selftest_datacomparefail_run<Type>,                     \
     .desired_duration = -1,                                             \
     .quality_level = TEST_QUALITY_PROD,                                 \
-},                                                                      \
-{                                                                       \
-    .id = "selftest_datacomparefail_" SANDSTONE_STRINGIFY(Type) "_with_cb", \
-    .description = "Attempts to compare one " SANDSTONE_STRINGIFY(Type) " (callback active)", \
+END_DECLARE_TEST                                                        \
+DECLARE_SELFTEST(SANDSTONE_CONCAT(SANDSTONE_CONCAT(selftest_datacomparefail_, Type), _with_cb), "Attempts to compare one " SANDSTONE_STRINGIFY(Type) " (callback active)") \
     .groups = DECLARE_TEST_GROUPS(&group_negative),                     \
     .test_init = selftest_datacomparefail_with_cb_init,                 \
     .test_run = selftest_datacomparefail_run<Type>,                     \
     .desired_duration = -1,                                             \
     .quality_level = TEST_QUALITY_PROD,                                 \
-},
+END_DECLARE_TEST
 FOREACH_DATATYPE(DATACOMPARE_TEST)
 #undef DATACOMPARE_TEST
-{
-    .id = "selftest_datacompare_pattern_fail",
-    .description = "Compares a buffer with injected failure to a bit pattern.",
+DECLARE_SELFTEST(selftest_long_double_mismatch, "Reports meaningful long double differences after padding")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_long_double_mismatch_run<false>,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_long_double_pattern_mismatch, "Reports meaningful long double pattern differences after padding")
+    .groups = DECLARE_TEST_GROUPS(&group_negative),
+    .test_run = selftest_long_double_mismatch_run<true>,
+    .desired_duration = -1,
+    .quality_level = TEST_QUALITY_PROD,
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacompare_pattern_fail, "Compares a buffer with injected failure to a bit pattern.")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_datacompare_pattern_fail_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_datacompare_nodifference",
-    .description = "Fakes a memcmp_or_fail that finds a difference that isn't there",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacompare_nodifference, "Fakes a memcmp_or_fail that finds a difference that isn't there")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_datacompare_nodifference_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_datacompare_pattern_nodifference",
-    .description = "Fakes a memcmp_byte_or_fail that finds a difference that isn't there",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacompare_pattern_nodifference, "Fakes a memcmp_byte_or_fail that finds a difference that isn't there")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_datacompare_pattern_nodifference_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_datacompare_nodifference_with_cb",
-    .description = "Fakes a memcmp_or_fail that finds a difference that isn't there (callback active)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_datacompare_nodifference_with_cb, "Fakes a memcmp_or_fail that finds a difference that isn't there (callback active)")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_datacompare_nodifference_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-
-{
-    .id = "selftest_cxxthrow",
-    .description = "Throws C++ exception",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_cxxthrow, "Throws C++ exception")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_cxxthrow_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_cxxthrow_with_cb",
-    .description = "Throws C++ exception",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_cxxthrow_with_cb, "Throws C++ exception")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_init_installcallback,
     .test_run = selftest_cxxthrow_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_abort",
-    .description = "Aborts",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_abort, "Aborts")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<abort>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_abortinit",
-    .description = "Aborts on init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_abortinit, "Aborts on init")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_crash_initcleanup<abort>,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigill",
-    .description = "Crashes with SIGILL",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigill, "Crashes with SIGILL")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigill>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigfpe",
-    .description = "Crashes with SIGFPE",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigfpe, "Crashes with SIGFPE")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigfpe>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigbus",
-    .description = "Crashes with SIGBUS",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigbus, "Crashes with SIGBUS")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigbus>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_init",
-    .description = "Crashes with SIGSEGV (data) on init",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_init, "Crashes with SIGSEGV (data) on init")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_crash_initcleanup<cause_sigsegv_null>,
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv",
-    .description = "Crashes with SIGSEGV (data) dereferencing the null page",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv, "Crashes with SIGSEGV (data) dereferencing the null page")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigsegv_null>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_noncanonical",
-    .description = "Crashes with SIGSEGV (data) with a non-canonical address",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_noncanonical, "Crashes with SIGSEGV (data) with a non-canonical address")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigsegv_noncanonical>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_kernel",
-    .description = "Crashes with SIGSEGV (data) on a kernel address",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_kernel, "Crashes with SIGSEGV (data) on a kernel address")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigsegv_kernel>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_cleanup",
-    .description = "Crashes with SIGSEGV (data) on cleanup",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_cleanup, "Crashes with SIGSEGV (data) on cleanup")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_pass_run,
     .test_cleanup  = selftest_crash_initcleanup<cause_sigsegv_null>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_instruction",
-    .description = "Crashes with SIGSEGV (instruction)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_instruction, "Crashes with SIGSEGV (instruction)")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigsegv_instruction>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigill_near_unreadable",
-    .description = "Crashes with SIGILL (UD2/UDF instruction) near a readable/unmapped page boundary",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigill_near_unreadable, "Crashes with SIGILL (UD2/UDF instruction) near a readable/unmapped page boundary")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigill_partial>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_readable_unreadable",
-    .description = "Crashes with SIGSEGV (instruction) jumping from a readable page into an unmapped page",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_readable_unreadable, "Crashes with SIGSEGV (instruction) jumping from a readable page into an unmapped page")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigsegv_readable_unreadable>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigsegv_unreadable_readable",
-    .description = "Crashes with SIGSEGV (instruction) on an unmapped page adjacent to a readable page",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigsegv_unreadable_readable, "Crashes with SIGSEGV (instruction) on an unmapped page adjacent to a readable page")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigsegv_unreadable_readable>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_sigtrap_int3",
-    .description = "Crashes with SIGTRAP (int3 instruction)",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_sigtrap_int3, "Crashes with SIGTRAP (int3 instruction)")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<cause_sigtrap_int3>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #ifdef _WIN32
-{
-    .id = "selftest_fastfail",
-    .description = "Executes __fastfail()",
+DECLARE_SELFTEST(selftest_fastfail, "Executes __fastfail()")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<raise_fastfail>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #else
-{
-    .id = "selftest_sigkill",
-    .description = "Raises SIGKILL",
+DECLARE_SELFTEST(selftest_sigkill, "Raises SIGKILL")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_crash_run<raise_sigkill>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #endif
-{
-    .id = "selftest_malloc_fail",
-    .description = "Attempts to malloc a silly amount of memory",
+DECLARE_SELFTEST(selftest_malloc_fail, "Attempts to malloc a silly amount of memory")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_malloc_fail,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_oserror",
-    .description = "Exits the test with an operating system error",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_oserror, "Exits the test with an operating system error")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_oserror_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_freeze",
-    .description = "Freezes",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_freeze, "Freezes")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #ifdef __unix__
-{
-    .id = "selftest_freeze_exit_on_termination",
-    .description = "Freezes and _exit()s on SIGQUIT",
+DECLARE_SELFTEST(selftest_freeze_exit_on_termination, "Freezes and _exit()s on SIGQUIT")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_exit_on_termination_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_freeze_ignore_termination",
-    .description = "Freezes and ignore SIGQUITs",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_freeze_ignore_termination, "Freezes and ignore SIGQUITs")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_init = selftest_ignore_termination_init,
     .test_run = selftest_noreturn_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_freeze_fork",
-    .description = "Freezes after forking",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_freeze_fork, "Freezes after forking")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_fork_run<selftest_noreturn_run_inner>,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #endif
-{
-    .id = "selftest_50pct_freeze_fail",
-    .description = "Freezes 50% of the time",
+DECLARE_SELFTEST(selftest_50pct_freeze_fail, "Freezes 50% of the time")
     .groups = DECLARE_TEST_GROUPS(&group_negative),
     .test_run = selftest_50pct_freeze_fail_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 
 #if defined(__linux__) && defined(__x86_64__) && !defined(__clang__) && defined(SANDSTONE_DEVICE_CPU)
-{
-    .id = "kvm_prot_64bit_fail",
-    .description = "Runs simple 64-bit KVM workload that fails",
+DECLARE_SELFTEST(kvm_prot_64bit_fail, "Runs simple 64-bit KVM workload that fails")
     .groups = DECLARE_TEST_GROUPS(&group_negative, &group_kvm),
     .test_init = kvm_generic_init,
     .test_run = kvm_generic_run,
@@ -2584,10 +2640,8 @@ FOREACH_DATATYPE(DATACOMPARE_TEST)
     .test_kvm_config = selftest_kvm_config_prot_64bit_fail,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "kvm_real_16bit_fail",
-    .description = "Runs simple 16-bit KVM workload that fails",
+END_DECLARE_TEST
+DECLARE_SELFTEST(kvm_real_16bit_fail, "Runs simple 16-bit KVM workload that fails")
     .groups = DECLARE_TEST_GROUPS(&group_negative, &group_kvm),
     .test_init = kvm_generic_init,
     .test_run = kvm_generic_run,
@@ -2595,137 +2649,105 @@ FOREACH_DATATYPE(DATACOMPARE_TEST)
     .test_kvm_config = selftest_kvm_config_real_16bit_fail,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #endif // __linux__
-{
-    .id = "selftest_inject_idle",
-    .description = "Verifies idle injection has no impact on test run time",
+DECLARE_SELFTEST(selftest_inject_idle, "Verifies idle injection has no impact on test run time")
     .groups = DECLARE_TEST_GROUPS(&group_positive),
     .test_run = selftest_inject_idle,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD
-},
+END_DECLARE_TEST
 // group of selftests that test test_is_optional flag
-{
-    .id = "selftest_test_optional",
-    .description = "Tests prod test without test_is_optional flag",
+DECLARE_SELFTEST(selftest_test_optional, "Tests prod test without test_is_optional flag")
     .groups = DECLARE_TEST_GROUPS(&group_test_is_optional),
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_test_optional_beta",
-    .description = "Tests beta test without test_is_optional flag",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_optional_beta, "Tests beta test without test_is_optional flag")
     .groups = DECLARE_TEST_GROUPS(&group_test_is_optional),
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_BETA,
-},
-{
-    .id = "selftest_test_optional_include_optional",
-    .description = "Tests prod test with test_is_optional flag",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_optional_include_optional, "Tests prod test with test_is_optional flag")
     .groups = DECLARE_TEST_GROUPS(&group_test_is_optional),
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
     .flags = test_is_optional,
-},
-{
-    .id = "selftest_test_optional_beta_include_optional",
-    .description = "Tests beta test with test_is_optional flag",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_optional_beta_include_optional, "Tests beta test with test_is_optional flag")
     .groups = DECLARE_TEST_GROUPS(&group_test_is_optional),
     .test_run = selftest_pass_run,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_BETA,
     .flags = test_is_optional,
-},
+END_DECLARE_TEST
 #if defined(__x86_64__) && !defined(__clang__) && defined(SANDSTONE_DEVICE_CPU)
-{
-    .id = "selftest_test_hsw_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_haswell",
+DECLARE_SELFTEST(selftest_test_hsw_min_cpu, "Tests prod test with min_cpu_level set to cpu_haswell")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_haswell,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_test_bdw_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_broadwell",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_bdw_min_cpu, "Tests prod test with min_cpu_level set to cpu_broadwell")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_broadwell,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_test_skl_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_skylake",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_skl_min_cpu, "Tests prod test with min_cpu_level set to cpu_skylake")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_skylake,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
 
-},
-{
-    .id = "selftest_test_skx_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_skylake_avx512",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_skx_min_cpu, "Tests prod test with min_cpu_level set to cpu_skylake_avx512")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_skylake_avx512,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
 
-},
-{
-    .id = "selftest_test_icx_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_icelake_server",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_icx_min_cpu, "Tests prod test with min_cpu_level set to cpu_icelake_server")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_icelake_server,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_test_spr_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_sapphirerapids",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_spr_min_cpu, "Tests prod test with min_cpu_level set to cpu_sapphirerapids")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_sapphirerapids,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_test_srf_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_sierraforest",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_srf_min_cpu, "Tests prod test with min_cpu_level set to cpu_sierraforest")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_sierraforest,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_test_gnr_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_graniterapids",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_gnr_min_cpu, "Tests prod test with min_cpu_level set to cpu_graniterapids")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_graniterapids,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
-{
-    .id = "selftest_test_dmr_min_cpu",
-    .description = "Tests prod test with min_cpu_level set to cpu_diamondrapids",
+END_DECLARE_TEST
+DECLARE_SELFTEST(selftest_test_dmr_min_cpu, "Tests prod test with min_cpu_level set to cpu_diamondrapids")
     .groups = DECLARE_TEST_GROUPS(&group_test_hw_features),
     .test_run = selftest_pass_run,
     .minimum_cpu = cpu_diamondrapids,
     .desired_duration = -1,
     .quality_level = TEST_QUALITY_PROD,
-},
+END_DECLARE_TEST
 #endif
-};
-
-extern const std::span<struct test> selftests;
-const std::span<struct test> selftests = { std::begin(selftests_array), std::end(selftests_array) };

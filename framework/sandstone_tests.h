@@ -22,10 +22,16 @@
 extern "C" {
 #endif
 
-extern struct test __start_tests;
-extern struct test __stop_tests;
+extern struct test __start_tests __attribute__((weak));
+extern struct test __stop_tests __attribute__((weak));
+
+extern struct test __start_selftests __attribute__((weak));
+extern struct test __stop_selftests __attribute__((weak));
 
 extern struct test _test_mce_check;
+#if defined(__linux__) && defined(__x86_64__)
+extern struct test _test_smi_count;
+#endif
 
 struct test_set_cfg {
     bool ignore_unknown_tests;  /* whether an error should be reported if
@@ -52,17 +58,24 @@ struct test_cfg_info {
 };
 
 #ifdef __cplusplus
+} // extern "C"
 
 inline std::span<struct test> regular_tests()
 {
     static std::span<struct test> value = { &__start_tests, &__stop_tests };
     return value;
 }
-#ifdef NO_SELF_TESTS
-constexpr const std::span<struct test> selftests = {};
-#else
-extern const std::span<struct test> selftests;
-#endif
+
+inline std::span<struct test> selftests()
+{
+    // Weak extern resolves to a null pointer, so need to guard against
+    // constructing a span from an invalid (null, null) range when no
+    // selftests are linked in (NO_SELF_TESTS, i.e. selftest.cpp isn't built).
+    static std::span<struct test> value = (&__start_selftests)
+        ? std::span<struct test>{ &__start_selftests, &__stop_selftests }
+        : std::span<struct test>{};
+    return value;
+}
 
 class SandstoneTestSet
 {
@@ -85,7 +98,7 @@ public:
         if (cfg.randomize) {
             /* Do not shuffle special tests if present. */
             auto end = test_set.end();
-            auto last = end - special_tests.size();
+            auto last = end - postexec_tests.size();
             std::shuffle(test_set.begin(), last, SandstoneURBG());
         }
         return test_set.begin();
@@ -111,9 +124,9 @@ public:
 
     std::vector<struct test_cfg_info> add_builtin_test_list(const char *name, std::vector<std::string> &errors);
 
-    const TestSet& get_special_tests() const noexcept
+    const TestSet& get_postexec_tests() const noexcept
     {
-        return special_tests;
+        return postexec_tests;
     }
 
 private:
@@ -129,7 +142,7 @@ private:
     /* list of all available tests. */
     TestSet all_tests;
     /* list of all 'special' tests. */
-    TestSet special_tests;
+    TestSet postexec_tests;
     /* maps group name to a vector of tests it contains. */
     std::map<std::string_view, std::vector<struct test *>> all_group_map;
 
@@ -144,7 +157,7 @@ private:
     {
 #ifndef NO_SELF_TESTS
         if (!SandstoneConfig::RestrictedCommandLine && cfg.is_selftest)
-            return selftests;
+            return selftests();
 #endif
         return regular_tests();
     }
@@ -154,7 +167,6 @@ private:
     }
 };
 
-}
 #endif
 
 #endif /* INC_SANDSTONE_TESTS_H */

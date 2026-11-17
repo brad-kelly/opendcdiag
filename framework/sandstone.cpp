@@ -319,6 +319,8 @@ static void attach_shmem_internal(int fd, size_t size)
 static void init_shmem()
 {
     using namespace PerThreadData;
+    static_assert(std::is_trivially_copyable_v<PerThreadData::Main>);
+    static_assert(std::is_trivially_copyable_v<PerThreadData::Test>);
     static_assert(sizeof(PerThreadData::Main) == 64,
             "PerThreadData::Main size grew, please check if it was intended");
     static_assert(sizeof(PerThreadData::Test) == 64,
@@ -1042,6 +1044,16 @@ int main(int argc, char **argv)
         }
     }
 
+#if SANDSTONE_DEVICE_IDXD
+        // TODO: it's possible to apply config even when running with --help/version.
+        // It's a consequence of pre-existing detect/setup_devices happening before taking opts.action.
+        if (opts.idxd_default_config) {
+            if (int ret = apply_global_idxd_config()) {
+                return ret;
+            }
+        }
+#endif
+
     if (!opts.deviceset.empty() && any_device) {
         for (auto& d : opts.deviceset) {
             apply_deviceset_param(d);
@@ -1147,11 +1159,11 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Add device-specific monitoring tests to the set. They will be kept last by
+    /* Add the postexec tests to the set. They will be kept last by
      * SandstoneTestSet in case randomization is requested. */
-    for (auto special_test : test_set->get_special_tests()) {
-        if (special_test != &_test_mce_check || (special_test == &_test_mce_check && !sApp->ignore_mce_errors))
-            test_set->add(special_test);
+    for (auto postexec_test : test_set->get_postexec_tests()) {
+        if (postexec_test != &_test_mce_check || (postexec_test == &_test_mce_check && !sApp->ignore_mce_errors))
+            test_set->add(postexec_test);
     }
 
     /* Remove all the tests we were told to disable */
@@ -1217,6 +1229,7 @@ int main(int argc, char **argv)
     TestResult lastTestResult = TestResult::Skipped;
 
     preinit_tests();
+    random_restore_seed();
     for (auto it = get_first_test(); it != test_set->end(); it = get_next_test(it)) {
         if (lastTestResult != TestResult::Skipped) {
             if (sApp->service_background_scan) {

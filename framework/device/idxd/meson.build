@@ -11,6 +11,7 @@ target_deps += [
 
 framework_files += files(
     'build_topology.cpp',
+    'idxd_config.cpp',
     'idxd_device.cpp',
     'topology.cpp',
     'logging_idxd.cpp',
@@ -21,6 +22,7 @@ unittests_sources += files(
     'unit-tests/idxd_features_tests.cpp',
     'unit-tests/topology_tests.cpp',
     'build_topology.cpp',
+    'idxd_device.cpp',
 )
 
 unittests_deps += [

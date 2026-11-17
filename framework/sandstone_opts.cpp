@@ -76,6 +76,7 @@ enum {
     output_format_option,
     quality_option,
     quick_run_option,
+    random_control_option,
     raw_list_test_ids,
     raw_list_tests,
     raw_list_group_members,
@@ -117,6 +118,9 @@ enum {
     thread_ratio_option,
     alpha_option,
     beta_option,
+#if SANDSTONE_DEVICE_IDXD
+    idxd_default_config_option,
+#endif
 
     // syntethic values to track which of conflicting opts is currently active
     _duration_option,
@@ -175,6 +179,7 @@ static struct option long_options[]  = {
     { "quality", required_argument, nullptr, quality_option },
     { "quick", no_argument, nullptr, quick_run_option },
     { "quiet", no_argument, nullptr, 'q' },
+    { "random-control", required_argument, nullptr, random_control_option },
     { "retest-on-failure", required_argument, nullptr, retest_on_failure_option },
     { "reschedule", required_argument, nullptr, reschedule_option },
     { "rng-state", required_argument, nullptr, 's' },
@@ -219,6 +224,9 @@ static struct option long_options[]  = {
     { "wrapper-script", required_argument, nullptr, wrapper_script_option },
     { "weighted-testrun-type", required_argument, nullptr, weighted_testrun_option },
     { "yaml", optional_argument, nullptr, 'Y' },
+#if SANDSTONE_DEVICE_IDXD
+    { "idxd-default-config", no_argument, nullptr, idxd_default_config_option },
+#endif
 
 #if defined(__SANITIZE_ADDRESS__)
     { "is-asan-build", no_argument, nullptr, is_asan_option },
@@ -284,6 +292,7 @@ Common command-line options are:
      Selectively enable/disable a given test. Can be given multiple times.
      <test> is a test's ID (see the -l option), a wildcard matching test IDs.
      or a test group (starting with @).
+     --disable='*' succeeds even when no test IDs match.
  --ignore-os-error, --ignore-timeout
      Continue execution of Sandstone even if a test encounters an operating
      system error (this includes tests timing out).
@@ -318,6 +327,12 @@ Common command-line options are:
  -s <STATE>, --rng-state=<STATE>
      Specify the random generator state to reload. The seed is in the form:
      Engine:engine-specific-data
+ --random-control=<CONTROLS>
+     Comma-separated list of controls that modify RNG behavior. Available controls:
+       uniform-thread-seed  Uniformly initialize the random generator in each thread
+                            to the same state.
+       fixed-seed           Do not advance the global seed between tests. Every test
+                            will start from the same seed.
  -v, -q, --verbose, --quiet
      Set logging output verbosity level. Default is quiet.
  --version
@@ -527,6 +542,9 @@ struct ProgramOptionsParser {
 #endif
             case include_optional_option:
             case ignore_unknown_tests_option:
+#if SANDSTONE_DEVICE_IDXD
+            case idxd_default_config_option:
+#endif
                 opts_map.emplace(opt, true);
                 break;
 
@@ -548,6 +566,7 @@ struct ProgramOptionsParser {
             case max_logdata_option:
             case max_messages_option:
             case reschedule_option:
+            case random_control_option:
             case thread_ratio_option:
             case wrapper_script_option:
                 opts_map.insert_or_assign(opt, optarg);
@@ -916,6 +935,9 @@ struct ProgramOptionsParser {
         opts.shmem_cfg.use_strict_runtime = opts_map.contains(strict_runtime_option);
         opts.shmem_cfg.sync_thread_start = opts_map.contains(sync_thread_start_option);
         opts.shmem_cfg.ud_on_failure = opts_map.contains(ud_on_failure_option);
+#if SANDSTONE_DEVICE_IDXD
+        opts.idxd_default_config = opts_map.contains(idxd_default_config_option);
+#endif
 
 #ifndef NDEBUG
         if (auto comm = string_opt_for(gdb_server_option))
@@ -1042,6 +1064,33 @@ struct ProgramOptionsParser {
             } else {
                 fprintf(ERR_STREAM, "%s: unknown reschedule mode: %s\n", argv[0], value);
                 return EX_USAGE;
+            }
+        }
+
+        if (auto value = string_opt_for(random_control_option)) {
+            std::string_view sv(value);
+            while (!sv.empty()) {
+                auto comma = sv.find(',');
+                auto token = sv.substr(0, comma);
+                if (token == "uniform-thread-seed") {
+                    opts.shmem_cfg.random_control_flags |=
+                        uint32_t(TestConfig::RandomControl::uniform_thread_seed);
+                } else if (token == "fixed-seed") {
+                    opts.shmem_cfg.random_control_flags |=
+                        uint32_t(TestConfig::RandomControl::fixed_seed);
+                } else if (token == "fixed-uniform-seed" || token == "uniform-fixed-seed") {
+                    // shorthand forms
+                    opts.shmem_cfg.random_control_flags |=
+                            uint32_t(TestConfig::RandomControl::fixed_seed) |
+                            uint32_t(TestConfig::RandomControl::uniform_thread_seed);
+                } else {
+                    fprintf(ERR_STREAM, "%s: unknown --random-control value: '%.*s'\n",
+                            argv[0], int(token.size()), token.data());
+                    return EX_USAGE;
+                }
+                if (comma == std::string_view::npos)
+                    break;
+                sv = sv.substr(comma + 1);
             }
         }
 

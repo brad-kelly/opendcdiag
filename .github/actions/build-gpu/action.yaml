@@ -55,12 +55,20 @@ runs:
             python3-yaml \
             yq \
             zlib1g-dev \
-            libze1 \
-            libze-dev \
             intel-ocloc \
             libigdfcl2 \
             libigc2
         echo "::endgroup::"
+    - name: Install Level Zero 1.32.0
+      shell: bash
+      run: |
+        wget -q -O /tmp/libze1_1.32.0+u24.04_amd64.deb \
+          'https://github.com/oneapi-src/level-zero/releases/download/v1.32.0/libze1_1.32.0+u24.04_amd64.deb'
+        wget -q -O /tmp/libze-dev_1.32.0+u24.04_amd64.deb \
+          'https://github.com/oneapi-src/level-zero/releases/download/v1.32.0/libze-dev_1.32.0+u24.04_amd64.deb'
+        DEBIAN_FRONTEND=noninteractive apt-get -y install \
+          /tmp/libze1_1.32.0+u24.04_amd64.deb \
+          /tmp/libze-dev_1.32.0+u24.04_amd64.deb
     - uses: actions/checkout@v6
     - name: meson setup
       shell: bash

@@ -14,6 +14,20 @@
 #include "sandstone_tests.h"
 #include "sandstone_chrono.h"
 
+/* Special tests that apply regardless of which device backend was built
+ * (as opposed to postexec_tests_for_device(), which is backend-specific).
+ * Tests run very last, after device-specific tests, in the order they
+ * are appended. */
+static std::vector<struct test*> postexec_tests_common()
+{
+    std::vector<struct test*> tests;
+#if defined(__linux__) && defined(__x86_64__)
+    tests.push_back(&_test_smi_count);
+#endif
+    tests.push_back(&_test_mce_check);
+    return tests;
+}
+
 void SandstoneTestSet::load_all_tests()
 {
     std::span<struct test> known_tests = test_source();
@@ -27,19 +41,39 @@ void SandstoneTestSet::load_all_tests()
         }
     };
 
-    for (struct test &t : known_tests) {
-        all_tests.push_back(&t);
+    std::vector<struct test *> ordered_tests;
+    ordered_tests.reserve(known_tests.size());
+    for (struct test &t : known_tests)
+        ordered_tests.push_back(&t);
+
+    if (is_selftest()) {
+        // Self-tests from the "selftest" section can be reordered when compiler
+        // optimization is enabled (behavior varies from compiler to compiler).
+        // On the other hand, the self-test plumbing in bats expects them to
+        // execute in the order of definition.
+        // To restore the order, the selftests are automatically numbered using
+        // the __COUNTER__ macro, with values intermittently stored as the short_id.
+        // Here we sort the selftests and assign them a standard short ID.
+        std::stable_sort(ordered_tests.begin(), ordered_tests.end(),
+                          [](struct test *a, struct test *b) {
+                              return a->shortid < b->shortid;
+                          });
+    }
+
+    for (struct test *t : ordered_tests) {
+        all_tests.push_back(t);
         if (is_selftest()) {
             // self tests don't have hardcoded test IDs, so add them now
-            t.shortid = std::hash<std::string_view>()(t.id) & 0xffffff;
+            t->shortid = std::hash<std::string_view>()(t->id) & 0xffffff;
         }
-        add_to_all_group_map(t);
+        add_to_all_group_map(*t);
     }
 
     /* add "special" tests */
-    special_tests = special_tests_for_device();
-    special_tests.push_back(&_test_mce_check); // mce always added last
-    for (struct test *t : special_tests) {
+    postexec_tests = postexec_tests_for_device();
+    for (struct test *t : postexec_tests_common())
+        postexec_tests.push_back(t);
+    for (struct test *t : postexec_tests) {
         add_to_all_group_map(*t);
     }
 }
@@ -71,7 +105,7 @@ std::vector<struct test *> SandstoneTestSet::lookup(const char *name)
                 return {t};
             }
         }
-        for (struct test *t : special_tests) {
+        for (struct test *t : postexec_tests) {
             if (!strcmp(t->id, name)) {
                 return {t};
             }
@@ -86,15 +120,19 @@ SandstoneTestSet::SandstoneTestSet(struct test_set_cfg cfg, unsigned int flags)
     load_all_tests(); /* initialize the catalog */
     if (!(flags & enable_all_tests)) return;
 
-    for (struct test &test : test_source()) {
-        if ((test.flags & test_is_optional) && !sApp->include_optional)
+    // Iterate all_tests (populated by load_all_tests(), already restored to
+    // declaration order for self-tests) rather than test_source() directly,
+    // so --list-tests/--list-group-members/full-catalog mode agree with the
+    // rest of the test set.
+    for (struct test *test : all_tests) {
+        if ((test->flags & test_is_optional) && !sApp->include_optional)
             continue;
-        if (test.quality_level < sApp->requested_quality)
+        if (test->quality_level < sApp->requested_quality)
             continue;
         struct test_cfg_info ti;
         ti.status = test_cfg_info::enabled;
-        ti.test = &test;
-        test_set.push_back(&test);
+        ti.test = test;
+        test_set.push_back(test);
     }
 };
 
@@ -134,8 +172,8 @@ int SandstoneTestSet::remove(const struct test *test)
 }
 
 /// Returns the number of tests that were removed from the test list, which may
-/// be zero if the test is valid but did not match. If it matched nothing, this
-/// function returns -1.
+/// be zero if the test is valid but did not match. An unmatched "*" is a no-op;
+/// other names or patterns that match nothing return -1.
 int SandstoneTestSet::remove(const char *name)
 {
     if (SandstoneConfig::RestrictedCommandLine) {
@@ -145,7 +183,7 @@ int SandstoneTestSet::remove(const char *name)
 
     std::vector tests = lookup(name);
     if (tests.size() == 0)
-        return -1;
+        return name && !strcmp(name, "*") ? 0 : -1;
 
     int res = 0;
     for (auto t : tests) {

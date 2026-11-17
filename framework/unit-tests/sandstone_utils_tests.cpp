@@ -11,8 +11,10 @@
 #include "sandstone_yaml.h"
 
 #include <limits.h>
+#include <float.h>
 #include <locale.h>
 #include <inttypes.h>
+#include <type_traits>
 
 #ifdef __x86_64__
 #pragma GCC diagnostic push
@@ -206,6 +208,7 @@ TEST(DataCompare, Float128)
 
 TEST(DataCompare, Float80)
 {
+#ifdef SANDSTONE_NATIVE_FLOAT80
     using namespace SandstoneDataDetails;
     setlocale(LC_ALL, "C");     // ensure C locale, so we get periods as decimal separators
     EXPECT_STREQ(type_name(Float80Data), "_Float64x");
@@ -220,6 +223,54 @@ TEST(DataCompare, Float80)
     EXPECT_EQ(format_type_helper(-std::numeric_limits<long double>::infinity()), "ffff8000000000000000 (-inf)");
     EXPECT_EQ(format_type_helper(std::numeric_limits<long double>::quiet_NaN()), "7fffc000000000000000 (nan)");
     EXPECT_EQ(format_type_helper(std::numeric_limits<long double>::signaling_NaN()), "7fffa000000000000000 (nan)");
+#else
+    GTEST_SKIP() << "long double is not x87 extended precision";
+#endif
+}
+
+namespace {
+template<typename T>
+concept HasNativeFloat80 = requires(T value) {
+    value.as_float;
+    value.as_fp();
+};
+
+#ifdef SANDSTONE_NATIVE_FLOAT80
+static_assert(HasNativeFloat80<Float80>);
+static_assert(std::is_constructible_v<Float80, long double>);
+#else
+static_assert(!HasNativeFloat80<Float80>);
+static_assert(!std::is_constructible_v<Float80, long double>);
+#endif
+}
+
+TEST(FloatGeneration, Float80Representation)
+{
+    const Float80 one = new_float80(0, FLOAT80_EXPONENT_BIAS, 1, 0);
+    EXPECT_EQ(one.as_hex.low64, uint64_t(1) << FLOAT80_MANTISSA_BITS);
+    EXPECT_EQ(one.as_hex.high16, FLOAT80_EXPONENT_BIAS);
+    EXPECT_TRUE(one.is_finite());
+    EXPECT_TRUE(Float80::max().is_max());
+#ifdef SANDSTONE_NATIVE_FLOAT80
+    EXPECT_EQ(one.as_fp(), 1.L);
+    EXPECT_EQ(Float80_as_fp(one), 1.L);
+    EXPECT_EQ(Float80(1.L).as_hex.high16, one.as_hex.high16);
+#endif
+}
+
+TEST(DataCompare, LongDouble)
+{
+#if LDBL_MANT_DIG == 53
+    EXPECT_EQ(format_type_helper(1.L), format_type_helper(1.0));
+#elif LDBL_MANT_DIG == 64
+    EXPECT_EQ(format_type_helper(1.L), "3fff8000000000000000 (0x8p-3)");
+#elif LDBL_MANT_DIG == 113
+    // Float128Data intentionally has a bit-exact hex renderer, not an x87 conversion.
+    EXPECT_EQ(format_type_helper(1.L), "3fff0000000000000000000000000000");
+    EXPECT_EQ(format_type_helper(-0.L), "80000000000000000000000000000000");
+    EXPECT_EQ(format_type_helper(std::numeric_limits<long double>::epsilon()),
+              "3f8f0000000000000000000000000000");
+#endif
 }
 
 TEST(DataCompare, Float64)
@@ -351,6 +402,86 @@ TEST(DataCompare, HFloat8)
     EXPECT_EQ(format_type_helper(my_numeric_limits<HFloat8>::neg_infinity()), "ff (-inf)");
     // no NaN values, these are treated as infinity
 }
+
+// TypeToDataType<T> cases DataCompare doesn't exercise: the handwritten
+// exceptions (_Bool, char, bool, void) and the width-dependent unsigned
+// long/long rows.
+TEST(ScalarTypeMapping, BoolCharVoidAndLongWidth)
+{
+    using namespace SandstoneDataDetails;
+    EXPECT_EQ(TypeToDataType<bool>::Type, UInt8Data);
+    EXPECT_EQ(TypeToDataType<char>::Type, UInt8Data);
+    EXPECT_EQ(TypeToDataType<void>::Type, UInt8Data);
+    EXPECT_EQ(TypeToDataType<unsigned long>::Type,
+              sizeof(unsigned long) == sizeof(unsigned long long) ? UInt64Data : UInt32Data);
+    EXPECT_EQ(TypeToDataType<long>::Type,
+              sizeof(long) == sizeof(long long) ? Int64Data : Int32Data);
+#ifdef __SIZEOF_FLOAT128__
+    EXPECT_EQ(TypeToDataType<__float128>::Type, Float128Data);
+#endif
+}
+
+// unsigned long long and long long map directly to 64-bit tags,
+// independent of platform long width.
+TEST(ScalarTypeMapping, UnsignedLongLongAndLongLong)
+{
+    using namespace SandstoneDataDetails;
+    EXPECT_EQ(TypeToDataType<unsigned long long>::Type, UInt64Data);
+    EXPECT_EQ(TypeToDataType<long long>::Type, Int64Data);
+}
+
+// Direct DATATYPEFORTYPE coverage.
+extern "C" int test_datatypefortype_c(void);
+TEST(ScalarTypeMapping, DATATYPEFORTYPE_CSide)
+{
+    EXPECT_EQ(test_datatypefortype_c(), 0);
+}
+
+// Compile-time checks for the shared mappings.
+namespace {
+using namespace SandstoneDataDetails;
+static_assert(TypeToDataType<bool>::Type == UInt8Data);
+static_assert(TypeToDataType<char>::Type == UInt8Data);
+static_assert(TypeToDataType<void>::Type == UInt8Data);
+static_assert(TypeToDataType<uint8_t>::Type == UInt8Data);
+static_assert(TypeToDataType<uint16_t>::Type == UInt16Data);
+static_assert(TypeToDataType<uint32_t>::Type == UInt32Data);
+static_assert(TypeToDataType<uint64_t>::Type == UInt64Data);
+static_assert(TypeToDataType<__uint128_t>::Type == UInt128Data);
+static_assert(TypeToDataType<int8_t>::Type == Int8Data);
+static_assert(TypeToDataType<int16_t>::Type == Int16Data);
+static_assert(TypeToDataType<int32_t>::Type == Int32Data);
+static_assert(TypeToDataType<int64_t>::Type == Int64Data);
+static_assert(TypeToDataType<__int128_t>::Type == Int128Data);
+static_assert(TypeToDataType<HFloat8>::Type == HFloat8Data);
+static_assert(TypeToDataType<BFloat8>::Type == BFloat8Data);
+static_assert(TypeToDataType<BFloat16>::Type == BFloat16Data);
+static_assert(TypeToDataType<Float16>::Type == Float16Data);
+static_assert(TypeToDataType<float>::Type == Float32Data);
+static_assert(TypeToDataType<double>::Type == Float64Data);
+static_assert(TypeToDataType<unsigned long>::Type ==
+              (sizeof(unsigned long) == sizeof(unsigned long long) ? UInt64Data : UInt32Data));
+static_assert(TypeToDataType<long>::Type ==
+              (sizeof(long) == sizeof(long long) ? Int64Data : Int32Data));
+static_assert(TypeToDataType<unsigned long long>::Type == UInt64Data);
+static_assert(TypeToDataType<long long>::Type == Int64Data);
+static_assert(FLT_RADIX == 2);
+#if LDBL_MANT_DIG == 53
+static_assert(TypeToDataType<long double>::Type == Float64Data);
+static_assert(LDBL_MIN_EXP == -1021 && LDBL_MAX_EXP == 1024);
+#elif LDBL_MANT_DIG == 64
+static_assert(TypeToDataType<long double>::Type == Float80Data);
+static_assert(LDBL_MIN_EXP == -16381 && LDBL_MAX_EXP == 16384);
+#elif LDBL_MANT_DIG == 113
+static_assert(TypeToDataType<long double>::Type == Float128Data);
+static_assert(LDBL_MIN_EXP == -16381 && LDBL_MAX_EXP == 16384);
+#endif
+static_assert(type_size(TypeToDataType<long double>::Type) == sizeof(long double));
+#ifdef __SIZEOF_FLOAT128__
+static_assert(TypeToDataType<Float128>::Type == Float128Data);
+static_assert(TypeToDataType<__float128>::Type == Float128Data);
+#endif
+} // namespace
 
 // dummy mocks to allow new_random_xxx() compilation
 __attribute__((weak)) uint32_t random32() {
@@ -717,7 +848,9 @@ int test_floats_prototypes_cpp(void)
     if (AS_FP(f) != 0.0) return __LINE__;
     if (AS_FP(float64) != 0.0) return __LINE__;
     if (AS_FP(d) != 0.0) return __LINE__;
+#ifdef SANDSTONE_NATIVE_FLOAT80
     if (AS_FP(float80) != 0.0) return __LINE__;
+#endif
 
     hfloat8 = new_random_hfloat8();
     bfloat8 = new_random_bfloat8();

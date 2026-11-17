@@ -88,7 +88,8 @@ tap_negative_check() {
             \#* | \
                 "$exit_line" | \
                 "THIS IS AN UNOPTIMIZED BUILD"* | \
-                "ok"*"mce_check")
+                "ok"*"mce_check" | \
+                "ok"*"smi_count"*)
                 # acceptable line
                 ;;
             "not ok"*)
@@ -457,6 +458,7 @@ function selftest_log_skip_init_common() {
     test_yaml_regexp "/tests/0/result" skip
     test_yaml_regexp "/tests/0/skip-category" Selftest
     test_yaml_regexp "/tests/0/skip-reason" "$skipmsg"
+    test_yaml_absent "/tests/0/threads@len"
 }
 
 @test "selftest_log_skip_init" {
@@ -650,6 +652,82 @@ function selftest_log_skip_init_common() {
     done
 }
 
+lifecycle_fork_modes() {
+    local mode
+    for mode in no yes exec; do
+        if $is_windows && [[ "$mode" == yes ]]; then
+            continue
+        fi
+        "$@" -f "$mode"
+    done
+}
+
+lifecycle_callbacks() {
+    declare -A yamldump
+    sandstone_selftest -n2 --no-slicing -e selftest_lifecycle -e selftest_lifecycle \
+        -e selftest_lifecycle_no_init -e selftest_lifecycle_no_cleanup \
+        -e selftest_lifecycle_sequential -e selftest_lifecycle_parent "$@"
+    [[ "$status" -eq 0 ]]
+    test_yaml_numeric "/tests@len" 'value == 6'
+    local i
+    for ((i = 0; i < 6; ++i)); do
+        test_yaml_regexp "/tests/$i/result" pass
+    done
+    [[ $(grep -c 'I> Lifecycle init' "$outputfile") -eq 5 ]]
+    [[ $(grep -c 'I> Lifecycle cleanup' "$outputfile") -eq 5 ]]
+    [[ $(grep -c 'I> Lifecycle callback destroyed' "$outputfile") -eq 5 ]]
+}
+
+@test "lifecycle: callbacks, omitted callbacks, sequential workers, and repeated attempts" {
+    lifecycle_fork_modes lifecycle_callbacks
+}
+
+lifecycle_init_result() {
+    local test=$1 ret=$2 result=$3
+    shift 3
+    declare -A yamldump
+    sandstone_selftest -n1 --no-slicing --max-messages=10 -e "$test" -e "$test" \
+        -O "$test.init_result=$ret" "$@"
+    if [[ "$result" == fail ]]; then
+        [[ "$status" -eq 1 ]]
+    else
+        [[ "$status" -eq 0 ]]
+    fi
+    test_yaml_numeric "/tests@len" 'value == 2'
+    test_yaml_regexp "/tests/0/result" "$result"
+    test_yaml_regexp "/tests/1/result" "$result"
+    ! grep -q 'I> Lifecycle worker\|I> Lifecycle cleanup' "$outputfile"
+    if [[ "$test" == selftest_lifecycle ]]; then
+        [[ $(grep -c 'I> Lifecycle callback destroyed' "$outputfile") -eq 2 ]]
+    fi
+}
+
+@test "lifecycle: init failure and skip reset without workers or cleanup" {
+    lifecycle_fork_modes lifecycle_init_result selftest_lifecycle 1 fail
+    lifecycle_fork_modes lifecycle_init_result selftest_lifecycle -1 skip
+}
+
+@test "lifecycle: init-only parent failure and skip reset" {
+    lifecycle_fork_modes lifecycle_init_result selftest_lifecycle_init_parent 1 fail
+    lifecycle_fork_modes lifecycle_init_result selftest_lifecycle_init_parent -1 skip
+}
+
+lifecycle_worker_failure() {
+    declare -A yamldump
+    sandstone_selftest -n1 --no-slicing -e selftest_lifecycle \
+        -O selftest_lifecycle.run_result=1 --retest-on-failure=1 --total-retest-on-failure=2 "$@"
+    [[ "$status" -eq 1 ]]
+    test_yaml_numeric "/tests@len" 'value == 2'
+    test_yaml_regexp "/tests/0/result" fail
+    test_yaml_regexp "/tests/1/result" fail
+    [[ $(grep -c 'I> Lifecycle cleanup' "$outputfile") -eq 2 ]]
+    [[ $(grep -c 'I> Lifecycle callback destroyed' "$outputfile") -eq 2 ]]
+}
+
+@test "lifecycle: cleanup after worker failure and retries" {
+    lifecycle_fork_modes lifecycle_worker_failure
+}
+
 @test "selftest_timedpass_no_fracture --max-test-loop-count=1" {
     # With just one loop, this should have very predictable timing
     declare -A yamldump
@@ -823,11 +901,11 @@ function selftest_log_yaml_common() {
 
 @test "selftest_logs_random_init" {
     declare -A yamldump
-    sandstone_selftest -e selftest_logs_random_init -s Constant:1234
+    sandstone_selftest -e selftest_logs_random_init -e selftest_preinit_random -s Constant:1234
     [[ "$status" -eq 0 ]]
     test_yaml_regexp "/tests/0/threads/0/messages/0/text" "I> 1234 1234 1234 1234"
 
-    sandstone_selftest -e selftest_logs_random_init -s LCG:1348219713
+    sandstone_selftest -e selftest_logs_random_init -e selftest_preinit_random -s LCG:1348219713
     [[ "$status" -eq 0 ]]
     test_yaml_expr "/tests/0/state/seed" = "LCG:1348219713"
     test_yaml_regexp "/tests/0/threads/0/messages/0/text" "I> 421843888 386376794 2046232626 184745881"
@@ -845,7 +923,8 @@ function selftest_log_yaml_common() {
     [[ "$output" = *'  Constant'* ]]
     [[ "$output" = *'  LCG'* ]]
     if [[ "$output" = *'  AES'* ]]; then
-        sandstone_selftest -e selftest_logs_random_init -s AES:87608d752b11fb972c8f0b4c19cdecf7789f728ad4ee0468d370f4b3e6321308
+        sandstone_selftest -e selftest_logs_random_init \
+            -s AES:87608d752b11fb972c8f0b4c19cdecf7789f728ad4ee0468d370f4b3e6321308
         [[ "$status" -eq 0 ]]
         test_yaml_regexp "/tests/0/state/seed" "AES:87608d752b11fb972c8f0b4c19cdecf7789f728ad4ee0468d370f4b3e6321308"
         test_yaml_regexp "/tests/0/threads/0/messages/0/text" "I> 1242137224 1378217084 1525375882 474233533"
@@ -858,6 +937,107 @@ function selftest_log_yaml_common() {
         [[ "$status" -eq 0 ]]
         test_yaml_regexp "/tests/0/state/seed" "AES:[0-9a-f]+"
     fi
+}
+
+@test "selftest_logs_random seed advances between tests" {
+    declare -A yamldump
+    sandstone_selftest -e selftest_logs_random_init -e selftest_logs_random
+    [[ "$status" -eq 0 ]]
+    test_yaml_regexp "/exit" pass
+
+    # By default, seeds must differ between tests
+    local seed0="${yamldump[/tests/0/state/seed]}"
+    local seed1="${yamldump[/tests/1/state/seed]}"
+    [[ -n "$seed0" ]]
+    if [[ "$seed0" == "$seed1" ]]; then
+        echo "Seeds are identical ('$seed0') but should differ" >&2
+        false
+    fi
+}
+
+@test "selftest_logs_random --random-control=fixed-seed" {
+    declare -A yamldump
+    sandstone_selftest -e selftest_logs_random_init -e selftest_logs_random \
+        --random-control=fixed-seed
+    [[ "$status" -eq 0 ]]
+    test_yaml_regexp "/exit" pass
+
+    # Both tests must have started with the same seed
+    local seed0="${yamldump[/tests/0/state/seed]}"
+    local seed1="${yamldump[/tests/1/state/seed]}"
+    [[ -n "$seed0" ]]
+    if [[ "$seed0" != "$seed1" ]]; then
+        echo "Seeds differ: test 0 had '$seed0', test 1 had '$seed1'" >&2
+        false
+    fi
+}
+
+@test "selftest_timedpass --random-control=fixed-seed does not advance seed between fractures" {
+    declare -A yamldump
+    # Use a duration long enough to force at least two fractures (auto-fracture runs 40 inner
+    # loops of 10 ms each = ~400 ms per fracture; 900 ms gives at least two fractures)
+    sandstone_selftest -e selftest_timedpass -t 900 --random-control=fixed-seed
+    [[ "$status" -eq 0 ]]
+    test_yaml_regexp "/exit" pass
+
+    # We need at least 2 fractures to verify the behavior
+    if [[ "${yamldump[/tests@len]}" -lt 2 ]]; then
+        skip "Only one fracture produced; cannot verify fixed-seed behavior across fractures"
+    fi
+
+    # All fractures of selftest_timedpass must have started with the same seed
+    local ref_seed="${yamldump[/tests/0/state/seed]}"
+    [[ -n "$ref_seed" ]]
+    for ((i = 1; i < yamldump[/tests@len]; ++i)); do
+        [[ "${yamldump[/tests/$i/test]}" == "selftest_timedpass" ]] || break
+        local this_seed="${yamldump[/tests/$i/state/seed]}"
+        if [[ "$this_seed" != "$ref_seed" ]]; then
+            echo "Fracture $i seed ('$this_seed') differs from fracture 0 ('$ref_seed')" >&2
+            false
+        fi
+    done
+}
+
+@test "selftest_logs_random --random-control=uniform-thread-seed" {
+    declare -A yamldump
+    sandstone_selftest -e selftest_logs_random --random-control=uniform-thread-seed
+    [[ "$status" -eq 0 ]]
+    test_yaml_regexp "/exit" pass
+
+    # All threads must produce the same random output
+    local first="${yamldump[/tests/0/threads/0/messages/0/text]}"
+    [[ -n "$first" ]]
+    for ((i = 1; i < yamldump[/tests/0/threads@len]; ++i)); do
+        local other="${yamldump[/tests/0/threads/$i/messages/0/text]}"
+        if [[ "$first" != "$other" ]]; then
+            echo "Thread $i output ($other) differs from thread 0 ($first)" >&2
+            false
+        fi
+    done
+}
+
+@test "selftest_logs_random --random-control=uniform-thread-seed,fixed-seed" {
+    local -r SEED=LCG:1348219713
+    declare -A yamldump
+    sandstone_selftest -e selftest_logs_random_init -e selftest_logs_random \
+        -s $SEED --random-control=uniform-thread-seed,fixed-seed
+    [[ "$status" -eq 0 ]]
+    test_yaml_regexp "/exit" pass
+
+    # Both tests must report the exact seed we passed with -s
+    test_yaml_expr "/tests/0/state/seed" = "$SEED"
+    test_yaml_expr "/tests/1/state/seed" = "$SEED"
+
+    # All threads in the second test must produce the same random output
+    local first="${yamldump[/tests/1/threads/0/messages/0/text]}"
+    [[ -n "$first" ]]
+    for ((i = 1; i < yamldump[/tests/1/threads@len]; ++i)); do
+        local other="${yamldump[/tests/1/threads/$i/messages/0/text]}"
+        if [[ "$first" != "$other" ]]; then
+            echo "Thread $i output ($other) differs from thread 0 ($first)" >&2
+            false
+        fi
+    done
 }
 
 test_random() {
@@ -1008,6 +1188,18 @@ test_random() {
     run $SANDSTONE --selftests --disable=non_existing_test
     [[ "$status" -eq 64 ]]
     [[ "$output" = *"Cannot find matching tests for 'non_existing_test' to disable"* ]]
+}
+
+@test "--disable non-existing pattern (pre)" {
+    run $SANDSTONE --selftests '--disable=*non_existing_test'
+    [[ "$status" -eq 64 ]]
+    [[ "$output" = *"Cannot find matching tests for '*non_existing_test' to disable"* ]]
+}
+
+@test "--disable non-existing pattern (post)" {
+    run $SANDSTONE --selftests '--disable=non_existing_test*'
+    [[ "$status" -eq 64 ]]
+    [[ "$output" = *"Cannot find matching tests for 'non_existing_test*' to disable"* ]]
 }
 
 @test "--enable non-existing test" {
@@ -1669,6 +1861,29 @@ function selftest_cxxthrow_common() {
     fail_callback_common
 }
 
+@test "selftest_memcmp_c" {
+    declare -A yamldump
+    sandstone_selftest -vvv -e selftest_memcmp_c
+    set -e
+    fail_common
+    test_yaml_regexp "/tests/0/threads/0/thread" '^main$'
+    test_yaml_regexp "/tests/0/threads/0/messages/0/text" '^I> C worker memcmp cleanup after join$'
+    [[ "$output" != *"C worker unexpectedly continued after memcmp_or_fail"* ]]
+    for ((i = 1; i <= MAX_PROC; ++i)); do
+        local found=0
+        for ((j = 0; !found && j < ${yamldump[/tests/0/threads/$i/messages@len]}; ++j)); do
+            [[ "${yamldump[/tests/0/threads/$i/messages/$j/level]}" = error ]] || continue
+            found=1
+            local path="/tests/0/threads/$i/messages/$j/data-miscompare"
+            test_yaml_regexp "$path/type" '^uint32_t$'
+            test_yaml_regexp "$path/description" '^C worker stack-local mismatch$'
+            test_yaml_regexp "$path/actual" '^0x11111111( \(286331153\))?$'
+            test_yaml_regexp "$path/expected" '^0x22222222( \(572662306\))?$'
+        done
+        ((found))
+    done
+}
+
 @test "selftest_datacompare" {  # also "_with_cb" version
     declare -A yamldump
     local dataregexp='0x[0-9a-f]+( \(([-0-9]+|[-+0-9a-fpx.]+)\))?'
@@ -1681,7 +1896,8 @@ function selftest_cxxthrow_common() {
         type=${type%_with_cb}   # if any
         case "$type" in
             Float16)            type=_Float16;;
-            long_double)        type=_Float64x;;
+            BFloat16)           type=_BFloat16;;
+            long_double)        type='(_Float64x|_Float128|double)';;
         esac
         local description="data of type '$type'.*"
         case "$type" in
@@ -1712,6 +1928,29 @@ function selftest_cxxthrow_common() {
                     test_yaml_expr "/tests/0/threads/$i/messages/0/data-miscompare/details/rare" = False
                     test_yaml_numeric "/tests/0/threads/$i/messages/0/data-miscompare/details/count" 'value == 16'
                 fi
+            done
+            ((found))
+        done
+    done
+}
+
+@test "selftest_long_double_mismatch" {
+    declare -A yamldump
+    local test
+    for test in selftest_long_double_mismatch selftest_long_double_pattern_mismatch; do
+        sandstone_selftest -vvv -e "$test"
+        set -e
+        fail_common
+        for ((i = 1; i <= MAX_PROC; ++i)); do
+            local found=0
+            for ((j = 0; !found && j < ${yamldump[/tests/0/threads/$i/messages@len]}; ++j)); do
+                [[ "${yamldump[/tests/0/threads/$i/messages/$j/level]}" = error ]] || continue
+                found=1
+                local path="/tests/0/threads/$i/messages/$j/data-miscompare"
+                test_yaml_regexp "$path/description" '^element 2$'
+                test_yaml_regexp "$path/offset" '\[.*\]'
+                [[ "${yamldump[$path/actual]}" != "${yamldump[$path/expected]}" ]]
+                test_yaml_regexp "$path/mask" '0x[0-9a-f]*[1-9a-f][0-9a-f]*'
             done
             ((found))
         done
@@ -1785,6 +2024,56 @@ function selftest_datacompare_nodifference_common() {
         done
         ((found))
     done
+}
+
+# Container memcmp_or_fail overload. Size mismatch goes through report_fail_msg
+# (generic failure message, emitted from sandstone.h where the container overload
+# lives); content mismatch goes through SandstoneMemcmpOrFail::report() tagged
+# with the element's own DataType (uint32_t here, ContiguousComparable requires
+# a ValidDataType element so this tag always exists -- no byte-reinterpretation
+# fallback); the nodifference case must pass.
+
+@test "selftest_container_comparefail_size_mismatch" {
+    declare -A yamldump
+    sandstone_selftest -vvv -e selftest_container_comparefail_size_mismatch
+    set -e
+    fail_common
+    for ((i = 1; i <= MAX_PROC; ++i)); do
+        [[ "${yamldump[/tests/0/threads/$i/thread]}" = [0-9]* ]] || continue
+        local found=0
+        for ((j = 0; !found && j < ${yamldump[/tests/0/threads/$i/messages@len]}; ++j)); do
+            [[ "${yamldump[/tests/0/threads/$i/messages/$j/level]}" = error ]] || continue
+            found=1
+            test_yaml_regexp "/tests/0/threads/$i/messages/$j/level" error
+            test_yaml_regexp "/tests/0/threads/$i/messages/$j/text" 'E> Failed at .*:[0-9]+: container size mismatch: [0-9]+ vs [0-9]+'
+        done
+        ((found))
+    done
+}
+
+@test "selftest_container_comparefail_content_mismatch" {
+    declare -A yamldump
+    sandstone_selftest -vvv -e selftest_container_comparefail_content_mismatch
+    set -e
+    fail_common
+    for ((i = 1; i <= MAX_PROC; ++i)); do
+        [[ "${yamldump[/tests/0/threads/$i/thread]}" = [0-9]* ]] || continue
+        local found=0
+        for ((j = 0; !found && j < ${yamldump[/tests/0/threads/$i/messages@len]}; ++j)); do
+            [[ "${yamldump[/tests/0/threads/$i/messages/$j/level]}" = error ]] || continue
+            found=1
+            test_yaml_regexp "/tests/0/threads/$i/messages/$j/level" error
+            test_yaml_regexp "/tests/0/threads/$i/messages/$j/data-miscompare/type" 'uint32_t'
+            test_yaml_regexp "/tests/0/threads/$i/messages/$j/data-miscompare/offset" '\[.*\]'
+            test_yaml_regexp "/tests/0/threads/$i/messages/$j/data-miscompare/address" '(0x)?[0-9a-f]+'
+        done
+        ((found))
+    done
+}
+
+@test "selftest_container_compare_nodifference" {
+    declare -A yamldump
+    sandstone_selftest -vvv -e selftest_container_compare_nodifference
 }
 
 selftest_freeze_msgs_common() {

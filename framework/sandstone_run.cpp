@@ -68,8 +68,6 @@ using namespace std::chrono_literals;
 
 device_features_t device_features;
 
-static const struct test *s_current_test = nullptr;
-
 #ifdef __llvm__
 thread_local int thread_num __attribute__((tls_model("initial-exec")));
 #else
@@ -78,7 +76,7 @@ thread_local int thread_num = 0;
 
 const struct test *current_test() noexcept
 {
-    return s_current_test;
+    return sApp->current_test;
 }
 
 static const char *path_to_exe()
@@ -179,15 +177,13 @@ static void merge_test_result(ChildExitStatus &current, const ChildExitStatus& i
 static void __attribute__((noreturn)) report_fail_common()
 {
     logging_mark_thread_failed(thread_num);
-#ifdef _WIN32
-    /* does not call the cleanup handlers */
-    _endthread();
-#else
-    /* does call the cleanup handalers */
+
+    // Runs the pthread_cleanup_push() handlers. On Linux, this also unwinds
+    // the stack and runs C++ destructors; elsewhere (including winpthreads),
+    // it doesn't.
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr);
     pthread_cancel(pthread_self());
-#endif
     __builtin_unreachable();
 }
 
@@ -211,18 +207,6 @@ void _report_fail_msg(const char *file, int line, const char *fmt, ...)
     if (!SandstoneConfig::NoLogging)
         log_error("Failed at %s:%d: %s", file, line, va_start_and_stdprintf(fmt).c_str());
     report_fail_common();
-}
-
-/* Like memcmp(), but returns the offset of the byte that differed (negative if equal) */
-static ptrdiff_t memcmp_offset(const uint8_t *d1, const uint8_t *d2, size_t size)
-{
-    ptrdiff_t i = 0;
-
-    for (; i < (ptrdiff_t) size; ++i) {
-        if (d1[i] != d2[i])
-            return i;
-    }
-    return -1;
 }
 
 #ifndef NDEBUG
@@ -321,7 +305,7 @@ void SandstoneMemcmpOrFail::report(const void *_actual, const void *_expected, s
 
         auto actual = static_cast<const uint8_t *>(_actual);
         auto expected = static_cast<const uint8_t *>(_expected);
-        ptrdiff_t offset = memcmp_offset(actual, expected, size);
+        ptrdiff_t offset = memcmp_offset(actual, expected, size, type);
 
         logging_report_mismatched_data(type, actual, expected, size, offset, formatter, t1, t2);
     }
@@ -744,6 +728,8 @@ static uintptr_t thread_runner(int thread_number)
                 new_state = thread_succeeded;
         }
         this_thread->thread_state.store(new_state, std::memory_order_relaxed);
+        int thrleft = sApp->main_thread_data()->active_threads.fetch_sub(1, std::memory_order_relaxed);
+        assert(thrleft >= 0); (void) thrleft;
 
         if (new_state == thread_failed) {
             if (sApp->shmem->cfg.ud_on_failure)
@@ -766,7 +752,10 @@ static uintptr_t thread_runner(int thread_number)
 #endif
 
     {
-        auto e = scopeExit(std::move(cleanup));
+        // Not scopeExit(): report_fail() doesn't unwind the stack on all OSes
+        auto cleanup_handler = +[](void *ptr) { (*static_cast<decltype(cleanup) *>(ptr))(); };
+        pthread_cleanup_push(cleanup_handler, &cleanup);
+
         // indicate to SIGQUIT handler that we're running
         this_thread->thread_state.store(thread_running, std::memory_order_relaxed);
 
@@ -781,6 +770,7 @@ static uintptr_t thread_runner(int thread_number)
         ret = test_run_wrapper_function(current_test(), thread_number);
 
         // cleanup resets thread_state
+        pthread_cleanup_pop(1);
     }
 
 #if SANDSTONE_DEVICE_CPU
@@ -841,6 +831,7 @@ static void run_threads_sequentially(const struct test *test)
 
 static void run_threads(const struct test *test)
 {
+    sApp->main_thread_data()->active_threads.store(sApp->thread_count, std::memory_order_relaxed);
     switch (test->flags & test_schedule_mask) {
     default:
         run_threads_in_parallel(test);
@@ -1150,8 +1141,16 @@ static void finish_test_common(struct test *test)
 
 static TestResult run_one_test_inner(struct test *test, bool init_in_aux_thread = false)
 {
-    s_current_test = test;
-    auto resetCurrentTest = scopeExit([&] { s_current_test = nullptr; });
+    sApp->current_test = test;
+    sApp->test_phase = SandstoneApplication::TestPhase::inactive;
+    auto resetCurrentTest = scopeExit([] {
+        sApp->test_phase = SandstoneApplication::TestPhase::inactive;
+        sApp->current_test = nullptr;
+    });
+
+    // Initialize/reset rescheduler state
+    if (device_scheduler)
+        device_scheduler->reset();
 
     TestResult state = [&] {
         int ret = 0;
@@ -1167,6 +1166,8 @@ static TestResult run_one_test_inner(struct test *test, bool init_in_aux_thread 
         sApp->prepare_test_tests(test);
 
         if (test->test_init) {
+            sApp->test_phase = SandstoneApplication::TestPhase::initializing;
+            auto resetPhase = scopeExit([] { sApp->test_phase = SandstoneApplication::TestPhase::inactive; });
             if (init_in_aux_thread) {
                 // ensure the init function is run pinned to a specific logical
                 // processor but its pinning doesn't affect this control thread
@@ -1212,9 +1213,13 @@ static TestResult run_one_test_inner(struct test *test, bool init_in_aux_thread 
         }
 
         sApp->at_run_threads_start(test);
+        sApp->test_phase = SandstoneApplication::TestPhase::running;
         run_threads(test);
+        sApp->test_phase = SandstoneApplication::TestPhase::inactive;
 
         if (test->test_cleanup) {
+            sApp->test_phase = SandstoneApplication::TestPhase::cleanup;
+            auto resetPhase = scopeExit([] { sApp->test_phase = SandstoneApplication::TestPhase::inactive; });
             ret = test->test_cleanup(test);
             PerThreadData::Main *thr = sApp->main_thread_data();
             if (ret > EXIT_SUCCESS || thr->has_failed()) {
@@ -1577,12 +1582,17 @@ static void run_one_test_init_in_parent(ChildrenList &children, const struct tes
     sApp->main_thread_data()->device_range = { 0, sApp->device_count };
     sApp->main_thread_data()->thread_range = { 0, sApp->thread_count };
 
-    s_current_test = test;
-    auto resetCurrentTest = scopeExit([&] { s_current_test = nullptr; });
+    sApp->current_test = test;
+    auto resetCurrentTest = scopeExit([] {
+        sApp->test_phase = SandstoneApplication::TestPhase::inactive;
+        sApp->current_test = nullptr;
+    });
 
     TestResult res;
     init_per_thread_data();
+    sApp->test_phase = SandstoneApplication::TestPhase::initializing;
     int ret = test->test_init(const_cast<struct test *>(test));
+    sApp->test_phase = SandstoneApplication::TestPhase::inactive;
 
     PerThreadData::Main *main = sApp->main_thread_data();
     if (ret < 0) [[likely]] {
@@ -1763,14 +1773,14 @@ TestResult run_one_test(const test_cfg_info &test_cfg, PerThreadFailures &per_th
         per_thread_failures.clear();
         per_thread_failures.resize(sApp->thread_count, 0);
     }
-    auto mark_up_per_thread_fail = [&per_thread_failures, &fail_count](int i) {
+    auto mark_up_per_thread_fail = [&per_thread_failures, &fail_count](int attempt) {
         ++fail_count;
-        if (i >= SandstoneApplication::MaxRetestCount)
+        if (attempt >= SandstoneApplication::MaxRetestCount)
             return;
-        for_each_test_thread([&](PerThreadData::Test *data, int i) {
+        for_each_test_thread([&](PerThreadData::Test *data, int thread) {
             using U = PerThreadFailures::value_type;
             if (data->has_failed())
-                per_thread_failures[i] |= U(1) << i;
+                per_thread_failures[thread] |= U(1) << attempt;
         });
     };
 
